@@ -149,6 +149,48 @@ def writeTXY_to_GeoTiff(array_result, filename):
 		band.WriteArray(array_result['array_result'].values()[0][i])
 		band.SetNoDataValue(no_data_value)
 		band.FlushCache()
+		
+def writeXY_to_GeoTiff(array_result, filename):
+	'''
+	Export XY/YX to GeoTiff
+
+	Parameters:
+		array_result: computed array as a result of execution
+		filename: name of output GeoTiff file
+	'''
+
+	no_data_value = array_result['array_output']['no_data_value']
+
+	dims = array_result['array_output']['shape']
+	dim_order = array_result['array_output']['dimensions_order']
+
+	num_t = 1
+	rows = int(dims[1])
+	cols = int(dims[2])
+
+	driver = gdal.GetDriverByName('GTiff')
+	dataset = driver.Create(filename, rows, cols, num_t, gdal.GDT_Int16)
+	
+	# set projection
+
+	proj = osr.SpatialReference()
+	#srs = array_result['plan']['array_output'].values()[0]['dimensions']['X']['crs']
+	srs = 'EPSG:4326'
+	proj.SetWellKnownGeogCS(srs)  
+	dataset.SetProjection(proj.ExportToWkt())
+	
+	# set geo transform
+	xmin = array_result['array_output']['dimensions']['X']['range'][0]
+	ymax = array_result['array_output']['dimensions']['Y']['range'][1]
+	pixel_size = 0.00025
+	geotransform = (xmin, pixel_size, 0, ymax,0, -pixel_size)  
+	dataset.SetGeoTransform(geotransform)
+
+
+	band = dataset.GetRasterBand(1)
+	band.WriteArray(array_result['array_result'].values()[0])
+	band.SetNoDataValue(no_data_value)
+	band.FlushCache()
 
 def writeNDVI2NetCDF(array_result, filename):
 	'''
