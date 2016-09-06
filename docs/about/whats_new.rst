@@ -1,8 +1,65 @@
 What's New
 ==========
 
-v1.1.5 Untranslatable Sign  (26 July 2016)
-------------------------------------------
+v1.1.8 Last Mammoth (5 September 2016)
+--------------------------------------
+
+  - :meth:`.GridWorkflow.list_tiles` and :meth:`.GridWorkflow.list_cells` now
+    return a :class:`.Tile` object
+
+  - Added `resampling` parameter to :meth:`.Datacube.load` and :meth:`.GridWorkflow.load`. Will only be used if the requested data requires resampling.
+
+  - Improved :meth:`.Datacube.load` `like` parameter behaviour. This allows passing in a :class:`xarray.Dataset` to retrieve data for the same region.
+
+  - Fixed an issue with passing tuples to functions in Analytics Expression Language
+
+  - Added a :ref:`user_guide` section to the documentation containing useful code snippets
+
+  - Reorganized project dependencies into required packages and optional 'extras'
+
+  - Added `performance` dependency extras for improving run-time performance
+
+  - Added `analytics` dependency extras for analytics features
+
+  - Added `interactive` dependency extras for interactivity features
+
+
+v1.1.7 Bit Shift (22 August 2016)
+---------------------------------
+
+  - Added bit shift and power operators to Analytics Expression Language
+
+  - Added `datacube product update` which can be used to update product definitions
+
+  - Fixed an issue where dataset geo-registration would be ignored in some cases
+
+  - Fixed an issue where Execution Engine was using dask arrays by default
+
+  - Fixed an issue where int8 data could not sometimes be retrieved
+
+  - Improved search and data retrieval performance
+
+
+v1.1.6 Lightning Roll (8 August 2016)
+-------------------------------------
+
+  - Improved spatio-temporal search performance. `datacube system init` must be run to benefit
+
+  - Added `info`, `archive` and `restore` commands to `datacube dataset`
+
+  - Added `product-counts` command to `datacube-search` tool
+
+  - Made Index object thread-safe
+
+  - Multiple masking API improvements
+
+  - Improved database Index API documentation
+
+  - Improved system configuration documentation
+
+
+v1.1.5 Untranslatable Sign (26 July 2016)
+-----------------------------------------
 
   - Updated the way database indexes are patitioned. Use `datacube system init --rebuild` to rebuild indexes
 
@@ -13,8 +70,8 @@ v1.1.5 Untranslatable Sign  (26 July 2016)
   - Added index.datasets.count method returning number of datasets matching the query
 
 
-v1.1.4 Imperfect Inspiration  (12 July 2016)
---------------------------------------------
+v1.1.4 Imperfect Inspiration (12 July 2016)
+-------------------------------------------
 
   - Improved dataset search performance
 

@@ -54,7 +54,7 @@ def attrs_all_equal(iterable, attr_name):
     return len({getattr(item, attr_name, float('nan')) for item in iterable}) <= 1
 
 
-def unsqueeze_data_array(da, dim, pos, coord=None):
+def unsqueeze_data_array(da, dim, pos, coord=None, attrs=None):
     """
     Adds a 1-length dimension to a data array
     :param xarray.DataArray da: array to add a 1-length dimension
@@ -70,7 +70,9 @@ def unsqueeze_data_array(da, dim, pos, coord=None):
     new_data = da.data.reshape(new_shape)
     new_coords = {k: v for k, v in da.coords.items()}
     if coord:
-        new_coords[dim] = coord
+        new_coords[dim] = xarray.DataArray([coord], dims=[dim])
+    if attrs:
+        new_coords[dim].attrs.update(attrs)
     return xarray.DataArray(new_data, dims=new_dims, coords=new_coords, attrs=da.attrs)
 
 
@@ -115,10 +117,29 @@ def get_doc_offset(offset, document):
     return value
 
 
-def parse_time(time):
+def _parse_time_generic(time):
     if isinstance(time, compat.string_types):
         return dateutil.parser.parse(time)
     return time
+
+
+try:
+    import ciso8601  # pylint: disable=wrong-import-position
+
+
+    def parse_time(time):
+        try:
+            result = ciso8601.parse_datetime(time)
+        except TypeError:
+            return time
+
+        if result is not None:
+            return result
+
+        return _parse_time_generic(time)
+except ImportError:
+    def parse_time(time):
+        return _parse_time_generic(time)
 
 
 def _points_to_ogr(points):
@@ -217,6 +238,7 @@ class NoDatesSafeLoader(SafeLoader):  # pylint: disable=too-many-ancestors
                                                          for tag, regexp in mappings
                                                          if tag != tag_to_remove]
 
+
 NoDatesSafeLoader.remove_implicit_resolver('tag:yaml.org,2002:timestamp')
 
 
@@ -243,10 +265,16 @@ def read_documents(*paths):
             opener = gzip.open
 
         if suffix in ('.yaml', '.yml'):
-            for parsed_doc in yaml.load_all(opener(str(path), 'r'), Loader=NoDatesSafeLoader):
-                yield path, parsed_doc
+            try:
+                for parsed_doc in yaml.load_all(opener(str(path), 'r'), Loader=NoDatesSafeLoader):
+                    yield path, parsed_doc
+            except yaml.YAMLError as e:
+                raise InvalidDocException('Failed to load %s: %s' % (path, e))
         elif suffix == '.json':
-            yield path, json.load(opener(str(path), 'r'))
+            try:
+                yield path, json.load(opener(str(path), 'r'))
+            except ValueError as e:
+                raise InvalidDocException('Failed to load %s: %s' % (path, e))
         else:
             raise ValueError('Unknown document type for {}; expected one of {!r}.'
                              .format(path.name, _ALL_SUPPORTED_EXTENSIONS))
@@ -450,6 +478,46 @@ def iter_slices(shape, chunk_size):
     [(slice(0, 2, None),), (slice(2, 4, None),), (slice(4, 5, None),)]
     """
     assert len(shape) == len(chunk_size)
-    num_grid_chunks = [int(ceil(s/float(c))) for s, c in zip(shape, chunk_size)]
+    num_grid_chunks = [int(ceil(s / float(c))) for s, c in zip(shape, chunk_size)]
     for grid_index in numpy.ndindex(*num_grid_chunks):
-        yield tuple(slice(min(d*c, stop), min((d+1)*c, stop)) for d, c, stop in zip(grid_index, chunk_size, shape))
+        yield tuple(
+            slice(min(d * c, stop), min((d + 1) * c, stop)) for d, c, stop in zip(grid_index, chunk_size, shape))
+
+
+def contains(v1, v2, case_sensitive=False):
+    """
+    Check that v1 contains v2
+
+    For dicts contains(v1[k], v2[k]) for all k in v2
+    For other types v1 == v2
+    Everything contains None
+
+    >>> contains("bob", "BOB")
+    True
+    >>> contains("bob", "BOB", case_sensitive=True)
+    False
+    >>> contains({'a':1, 'b': 2}, {'a':1})
+    True
+    >>> contains({'a':{'b': 'BOB'}}, {'a':{'b': 'bob'}})
+    True
+    >>> contains({'a':{'b': 'BOB'}}, {'a':{'b': 'bob'}}, case_sensitive=True)
+    False
+    >>> contains("bob", "alice")
+    False
+    >>> contains({'a':1}, {'a':1, 'b': 2})
+    False
+    >>> contains({'a': {'b': 1}}, {'a': None})
+    True
+    """
+    if v2 is None:
+        return True
+
+    if not case_sensitive:
+        if isinstance(v1, compat.string_types):
+            return isinstance(v2, compat.string_types) and v1.lower() == v2.lower()
+
+    if isinstance(v1, dict):
+        return isinstance(v2, dict) and all(contains(v1.get(k, object()), v, case_sensitive=case_sensitive)
+                                            for k, v in v2.items())
+
+    return v1 == v2

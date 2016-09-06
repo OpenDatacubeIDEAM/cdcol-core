@@ -229,9 +229,9 @@ class API(object):
         """
         query = DescriptorQuery(descriptor_request)
         descriptor = {}
-        datasets_by_type = self._search_datasets_by_type(**query.search_terms)
-        for dataset_type, datasets in datasets_by_type.items():
-            dataset_descriptor = self._get_descriptor_for_dataset(dataset_type, datasets,
+
+        for dataset_type, datasets in self.datacube.index.datasets.search_by_product(**query.search_terms):
+            dataset_descriptor = self._get_descriptor_for_dataset(dataset_type, list(datasets),
                                                                   query.group_by,
                                                                   query.geopolygon,
                                                                   include_storage_units)
@@ -240,20 +240,15 @@ class API(object):
         return descriptor
 
     def _search_datasets_by_type(self, **query):
-        datasets = self.datacube.index.datasets.search(**query)
-        datasets_by_type = defaultdict(list)
-        for dataset in datasets:
-            datasets_by_type[dataset.type].append(dataset)
-        return datasets_by_type
+        return dict(self.datacube.index.datasets.search_by_product(**query))
 
     def _get_dataset_groups(self, query):
         dataset_groups = {}
         group_by = query.group_by
 
-        datasets_by_type = self._search_datasets_by_type(**query.search_terms)
-        for dataset_type, datasets in datasets_by_type.items():
+        for dataset_type, datasets in self.datacube.index.datasets.search_by_product(**query.search_terms):
             if dataset_type.grid_spec:
-                dataset_groups[dataset_type] = self.datacube.product_sources(datasets,
+                dataset_groups[dataset_type] = self.datacube.product_sources(list(datasets),
                                                                              group_by.group_by_func,
                                                                              group_by.dimension,
                                                                              group_by.units)
@@ -347,7 +342,7 @@ class API(object):
             return data_descriptor
         return all_datasets
 
-    def _get_data_for_type(self, dataset_type, sources, measurements, geopolygon, slices=None):
+    def _get_data_for_type(self, dataset_type, sources, measurements, geopolygon, slices=None, chunks=None):
         dt_data = {}
         datasets = list(chain.from_iterable(g for _, g in numpy.ndenumerate(sources)))
         if not geopolygon:
@@ -362,7 +357,7 @@ class API(object):
                 if dim in sources.dims:
                     sources = sources.isel(dim=dim_slice)
         dt_data.update(self._get_data_for_dims(dataset_type, sources, geobox))
-        dt_data.update(self._get_data_for_measurement(dataset_type, sources, measurements, geobox))
+        dt_data.update(self._get_data_for_measurement(dataset_type, sources, measurements, geobox, dask_chunks=chunks))
         return dt_data
 
     @staticmethod
@@ -401,11 +396,10 @@ class API(object):
                 raise NotImplementedError('Unsupported dimension type: ', dim)
         return dt_data
 
-    def _get_data_for_measurement(self, dataset_type, sources, measurements, geobox):
+    def _get_data_for_measurement(self, dataset_type, sources, measurements, geobox, dask_chunks=None):
         dt_data = {
             'arrays': {}
         }
-        dask_chunks = {dim: 1000 for dim in geobox.dimensions}
         for measurement_name, measurement in dataset_type.measurements.items():
             if measurements is None or measurement_name in measurements:
                 dt_data['arrays'][measurement_name] = self.datacube.measurement_data(sources, geobox, measurement,

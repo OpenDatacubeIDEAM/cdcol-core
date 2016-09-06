@@ -3,6 +3,7 @@ import os
 import sys
 import xarray as xr
 import numpy as np
+import pytest
 
 from datacube.ndexpr import NDexpr
 
@@ -54,7 +55,7 @@ def test_2():
     assert ne.test("fabs(z1)", xr.ufuncs.fabs(z1))
     assert ne.test("fix(z1)", xr.ufuncs.fix(z1))
     assert ne.test("floor(z1)", xr.ufuncs.floor(z1))
-    assert ne.test("frexp(z3)", xr.DataArray(xr.ufuncs.frexp(z3)))
+    assert ne.test("frexp(z3)", xr.ufuncs.frexp(z3))
     assert ne.test("imag(z1)", xr.ufuncs.imag(z1))
     assert ne.test("iscomplex(z1)", xr.ufuncs.iscomplex(z1))
     assert ne.test("isfinite(z1)", xr.ufuncs.isfinite(z1))
@@ -65,6 +66,10 @@ def test_2():
     assert ne.test("log10(z1)", xr.ufuncs.log10(z1))
     assert ne.test("log1p(z1)", xr.ufuncs.log1p(z1))
     assert ne.test("log2(z1)", xr.ufuncs.log2(z1))
+    assert ne.test("pow(z1, 2.0)", np.power(z1, 2.0))
+    assert ne.test("pow(z1, 2)", np.power(z1, 2))
+    assert ne.test("z1^2", np.power(z1, 2))
+    assert ne.test("z1**2", np.power(z1, 2))
     assert ne.test("rad2deg(z1)", xr.ufuncs.rad2deg(z1))
     assert ne.test("radians(z1)", xr.ufuncs.radians(z1))
     assert ne.test("real(z1)", xr.ufuncs.real(z1))
@@ -165,6 +170,8 @@ def test_2():
                    np.percentile(z1, (50, 60, 70)) + np.percentile(z1, (50, 60, 70)))
     assert ne.test("1 + var(z1, 0, 0+1, 2) + 1", 1+xr.DataArray.var(z1, axis=(0, 0+1, 2))+1)
 
+    assert ne.test("1 + ((z1+z1)*0.0005)**2 + 1", 1 + np.power((z1+z1)*0.0005, 2) + 1)
+
     assert ne.test("z1{mask1}", xr.DataArray.where(z1, mask1))
     assert ne.test("z1{z1>2}", xr.DataArray.where(z1, z1 > 2))
     assert ne.test("z1{z1>=2}", xr.DataArray.where(z1, z1 >= 2))
@@ -189,6 +196,13 @@ def test_2():
 
     assert ne.test("-z1", -z1)
     assert ne.test("z1{!(z1<2)}", xr.DataArray.where(z1, xr.ufuncs.logical_not(z1 < 2)))
+
+    assert ne.test("z1>>1", np.right_shift(z1, 1))
+    assert ne.test("z1<<1", np.left_shift(z1, 1))
+
+    assert ne.test("(z1+z1)", z1+z1)
+    assert ne.evaluate("(z1, z1)") == (z1, z1)
+    assert ne.evaluate('(1, (4, 5))') == (1, (4, 5))
 
 
 def test_3():

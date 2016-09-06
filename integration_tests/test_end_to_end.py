@@ -169,9 +169,18 @@ def check_open_with_dc(index):
     dataset = dc.load(product='ls5_nbar_albers', latitude=(-35.2, -35.3), longitude=(149.1, 149.2))
     assert dataset['blue'].size
 
+    dataset_like = dc.load(product='ls5_nbar_albers', measurements=['blue'], like=dataset)
+    assert (dataset.blue == dataset_like.blue).all()
+
     data_array = dc.load(product='ls5_nbar_albers',
                          latitude=(-35, -36), longitude=(149, 150),
                          measurements=['blue'], group_by='solar_day')
+
+    dataset = dc.load(product='ls5_nbar_albers', latitude=(-35.2, -35.3), longitude=(149.1, 149.2), align=(5, 20))
+    assert dataset.geobox.affine.f % abs(dataset.geobox.affine.e) == 5
+    assert dataset.geobox.affine.c % abs(dataset.geobox.affine.a) == 20
+    dataset_like = dc.load(product='ls5_nbar_albers', measurements=['blue'], like=dataset)
+    assert (dataset.blue == dataset_like.blue).all()
 
     products_df = dc.list_products()
     assert len(products_df)
@@ -179,6 +188,26 @@ def check_open_with_dc(index):
     assert len(products_df[products_df['name'].isin(['ls5_pq_albers'])])
 
     assert len(dc.list_measurements())
+
+    resamp = ['nearest', 'cubic', 'bilinear', 'cubic_spline', 'lanczos', 'average']
+    results = {}
+
+    def calc_max_change(da):
+        midline = int(da.shape[0] * 0.5)
+        a = int(abs(da[midline, :-1].data - da[midline, 1:].data).max())
+
+        centerline = int(da.shape[1] * 0.5)
+        b = int(abs(da[:-1, centerline].data - da[1:, centerline].data).max())
+        return a + b
+
+    for resamp_meth in resamp:
+        dataset = dc.load(product='ls5_nbar_albers', measurements=['blue'],
+                          latitude=(-35.28, -35.285), longitude=(149.15, 149.155),
+                          output_crs='EPSG:4326', resolution=(-0.0000125, 0.0000125), resampling=resamp_meth)
+        results[resamp_meth] = calc_max_change(dataset.blue.isel(time=0))
+
+    assert results['cubic_spline'] < results['nearest']
+    assert results['lanczos'] < results['average']
 
 
 def check_open_with_grid_workflow(index):

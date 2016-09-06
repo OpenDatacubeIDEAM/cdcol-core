@@ -40,7 +40,6 @@ import numpy as np
 import xarray as xr
 from xarray import ufuncs
 from scipy import ndimage
-import matplotlib.pyplot as plt
 
 from pyparsing import Literal, CaselessLiteral, Word, Combine, Group,\
     Optional, ZeroOrMore, Forward, nums, alphas, delimitedList,\
@@ -78,7 +77,11 @@ class NDexpr(object):
                     "!=": operator.ne,
                     "|": operator.or_,
                     "&": operator.and_,
-                    "!": operator.inv}
+                    "!": operator.inv,
+                    "^": operator.pow,
+                    "**": operator.pow,
+                    "<<": np.left_shift,
+                    ">>": np.right_shift}
 
         # Define xarray DataArray operators with 1 input parameter
         self.xfn1 = {"angle": xr.ufuncs.angle,
@@ -143,7 +146,8 @@ class NDexpr(object):
                      "nextafter": xr.ufuncs.nextafter}
 
         # Define non-xarray DataArray operators with 2 input parameter
-        self.fn2 = {"percentile": np.percentile}
+        self.fn2 = {"percentile": np.percentile,
+                    "pow": np.power}
 
         # Define xarray DataArray reduction operators
         self.xrfn = {"all": xr.DataArray.all,
@@ -176,6 +180,8 @@ class NDexpr(object):
         minus = Literal("-")
         mult = Literal("*")
         div = Literal("/")
+        ls = Literal("<<")
+        rs = Literal(">>")
         gt = Literal(">")
         gte = Literal(">=")
         lt = Literal("<")
@@ -198,63 +204,53 @@ class NDexpr(object):
         addop = plus | minus
         multop = mult | div
         sliceop = colon
+        shiftop = ls | rs
         compop = gte | lte | gt | lt
         eqop = eq | neq
         bitcompop = b_or | b_and
         bitnotop = b_not
         logicalnotop = l_not
         assignop = seq
-        expop = Literal("^")
+        expop = Literal("^") | Literal("**")
 
         expr = Forward()
         indexexpr = Forward()
 
-        atom = (Optional("-") +
-                (variable + seq + expr).setParseAction(self.push_assign) |
-                indexexpr.setParseAction(self.push_index) |
-                (lpar + expr + qmark.setParseAction(self.push_ternary1) + expr +
-                 scolon.setParseAction(self.push_ternary2) + expr +
-                 rpar).setParseAction(self.push_ternary) |
-                (lpar + expr + qmark + expr + scolon + expr +
-                 rpar).setParseAction(self.push_ternary) |
-                (logicalnotop + expr).setParseAction(self.push_ulnot) |
-                (bitnotop + expr).setParseAction(self.push_unot) |
-                (minus + expr).setParseAction(self.push_uminus) |
-                (variable + lcurl + expr +
-                 rcurl).setParseAction(self.push_mask) |
-                (variable + lpar + expr + (comma + expr)*3 +
-                 rpar).setParseAction(self.push_expr4) |
-                (variable + lpar + expr + (comma + expr)*2 +
-                 rpar).setParseAction(self.push_expr3) |
-                (variable + lpar + expr + comma + expr +
-                 rpar).setParseAction(self.push_expr2) |
-                (variable + lpar + expr + rpar |
-                 variable).setParseAction(self.push_expr1) |
-                fnumber.setParseAction(self.push_expr) |
-                (lpar + expr + ZeroOrMore(comma + expr).setParseAction(self.get_tuple) +
-                 rpar).setParseAction(self.push_tuple) |
-                (lpar + expr.suppress() +
-                 rpar).setParseAction(self.push_uminus))
+        ternary_p = (lpar + expr + qmark.setParseAction(self.push_ternary1) + expr +
+                     scolon.setParseAction(self.push_ternary2) + expr +
+                     rpar).setParseAction(self.push_ternary)
+
+        atom = (
+            (variable + seq + expr).setParseAction(self.push_assign) |
+            indexexpr.setParseAction(self.push_index) |
+            ternary_p |
+            (logicalnotop + expr).setParseAction(self.push_ulnot) |
+            (bitnotop + expr).setParseAction(self.push_unot) |
+            (minus + expr).setParseAction(self.push_uminus) |
+            (variable + lcurl + expr + rcurl).setParseAction(self.push_mask) |
+            (variable + lpar + delimitedList(Group(expr)) + rpar).setParseAction(self.push_call) |
+            (fnumber | variable).setParseAction(self.push_expr) |
+            (lpar + delimitedList(Group(expr)) + rpar).setParseAction(self.push_tuple)
+        )
 
         # Define order of operations for operators
 
-        factor = Forward()
-        factor << atom + ZeroOrMore((expop + factor).setParseAction(self.push_op))
-        term = factor + ZeroOrMore((multop + factor).setParseAction(self.push_op))
-        term2 = term + ZeroOrMore((addop + term).setParseAction(self.push_op))
-        term3 = term2 + ZeroOrMore((sliceop + term2).setParseAction(self.push_op))
-        term4 = term3 + ZeroOrMore((compop + term3).setParseAction(self.push_op))
-        term5 = term4 + ZeroOrMore((eqop + term4).setParseAction(self.push_op))
-        term6 = term5 + ZeroOrMore((bitcompop + term5).setParseAction(self.push_op))
-        expr << term6 + ZeroOrMore((assignop + term6).setParseAction(self.push_op))
+        exp_p = Forward()
+        exp_p << atom + ZeroOrMore((expop + exp_p).setParseAction(self.push_op))
+        mult_p = exp_p + ZeroOrMore((multop + exp_p).setParseAction(self.push_op))
+        add_p = mult_p + ZeroOrMore((addop + mult_p).setParseAction(self.push_op))
+        shift_p = add_p + ZeroOrMore((shiftop + add_p).setParseAction(self.push_op))
+        slice_p = shift_p + ZeroOrMore((sliceop + shift_p).setParseAction(self.push_op))
+        comp_p = slice_p + ZeroOrMore((compop + slice_p).setParseAction(self.push_op))
+        eq_p = comp_p + ZeroOrMore((eqop + comp_p).setParseAction(self.push_op))
+        bitcmp_p = eq_p + ZeroOrMore((bitcompop + eq_p).setParseAction(self.push_op))
+        expr << bitcmp_p + ZeroOrMore((assignop + bitcmp_p).setParseAction(self.push_op))
 
         # Define index operators
 
-        colon_expr = (colon + FollowedBy(comma) ^ colon +
-                      FollowedBy(rbrac)).setParseAction(self.push_colon)
+        colon_expr = (colon + FollowedBy(comma) ^ colon + FollowedBy(rbrac)).setParseAction(self.push_colon)
         range_expr = colon_expr | expr | colon
-        indexexpr << (variable + lbrac + delimitedList(range_expr, delim=',') +
-                      rbrac).setParseAction(self.push_expr)
+        indexexpr << (variable + lbrac + delimitedList(range_expr, delim=',') + rbrac).setParseAction(self.push_expr)
 
         self.parser = expr
 
@@ -264,24 +260,9 @@ class NDexpr(object):
     def push_expr(self, strg, loc, toks):
         self.expr_stack.append(toks[0])
 
-    def push_expr1(self, strg, loc, toks):
+    def push_call(self, strg, loc, toks):
         if toks[0] in self.xrfn:
-            self.expr_stack.append('1')
-        self.expr_stack.append(toks[0])
-
-    def push_expr2(self, strg, loc, toks):
-        if toks[0] in self.xrfn:
-            self.expr_stack.append('2')
-        self.expr_stack.append(toks[0])
-
-    def push_expr3(self, strg, loc, toks):
-        if toks[0] in self.xrfn:
-            self.expr_stack.append('3')
-        self.expr_stack.append(toks[0])
-
-    def push_expr4(self, strg, loc, toks):
-        if toks[0] in self.xrfn:
-            self.expr_stack.append('4')
+            self.expr_stack.append(str(len(toks)-1))
         self.expr_stack.append(toks[0])
 
     def push_op(self, strg, loc, toks):
@@ -303,13 +284,9 @@ class NDexpr(object):
         self.expr_stack.append("[]")
 
     def push_tuple(self, strg, loc, toks):
-        if ',' in toks.asList():
+        if len(toks) != 1:
+            self.expr_stack.append(str(len(toks)))
             self.expr_stack.append("()")
-
-    def get_tuple(self, strg, loc, toks):
-        count = toks.asList().count(',')
-        if count > 0:
-            self.expr_stack.append(str(count+1))
 
     def push_colon(self, strg, loc, toks):
         self.expr_stack.append("::")
@@ -360,6 +337,8 @@ class NDexpr(object):
             if op == '+' and isinstance(op2, xr.DataArray) and \
                op2.dtype.type == np.bool_:
                 return xr.DataArray.where(op1, op2)
+            elif op == "<<" or op == ">>":
+                return self.opn[op](op1, int(op2))
             return self.opn[op](op1, op2)
         elif op == "::":
             return slice(None, None, None)
@@ -519,6 +498,8 @@ class NDexpr(object):
             r = e == result
         elif isinstance(e, np.ndarray):
             r = result.equals(xr.DataArray(e))
+        elif isinstance(e, tuple):
+            r = (np.array(result.item()).flatten() == np.array(e).flatten()).all()
         else:
             r = e.equals(result)
         if r:
@@ -577,6 +558,9 @@ class NDexpr(object):
 
     def plot_3d(self, array_result):
         print('plot3D')
+        # Matplotlib is an optional requirement, so it's not imported globally.
+        # pylint: disable=import-error
+        import matplotlib.pyplot as plt
 
         img = array_result
         num_t = img.shape[0]

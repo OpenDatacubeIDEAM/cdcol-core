@@ -5,6 +5,7 @@ Common datatypes for DB drivers.
 from __future__ import absolute_import
 # For the search API.
 from datacube.model import Range
+from .exceptions import UnknownFieldError
 
 
 class Field(object):
@@ -47,11 +48,14 @@ class OrExpression(Expression):
         super(OrExpression, self).__init__()
         self.exprs = exprs
 
+    def evaluate(self, ctx):
+        return any(expr.evaluate(ctx) for expr in self.exprs)
+
 
 def _to_expression(get_field, name, value):
     field = get_field(name)
     if field is None:
-        raise RuntimeError('Unknown field %r' % name)
+        raise UnknownFieldError('Unknown field %r' % name)
 
     if isinstance(value, Range):
         return field.between(value.begin, value.end)

@@ -23,6 +23,7 @@ import datetime
 import collections
 
 from dateutil import tz
+from pandas import to_datetime as pandas_to_datetime
 import numpy as np
 
 from ..compat import string_types, integer_types
@@ -34,7 +35,7 @@ _LOG = logging.getLogger(__name__)
 
 GroupBy = collections.namedtuple('GroupBy', ['dimension', 'group_by_func', 'units'])
 
-FLOAT_TOLERANCE = 0.0000001 # TODO: For DB query, use some sort of 'contains' query, rather than range overlap.
+FLOAT_TOLERANCE = 0.0000001  # TODO: For DB query, use some sort of 'contains' query, rather than range overlap.
 SPATIAL_KEYS = ('latitude', 'lat', 'y', 'longitude', 'lon', 'long', 'x')
 CRS_KEYS = ('crs', 'coordinate_reference_system')
 OTHER_KEYS = ('measurements', 'group_by', 'output_crs', 'resolution', 'set_nan', 'product', 'geopolygon', 'like')
@@ -44,14 +45,18 @@ class Query(object):
     def __init__(self, index=None, product=None, geopolygon=None, like=None, **kwargs):
         """Parses a kwarg dict for query parameters
 
-        :param index: An optional `index` object, if checking of field names is desired.
+        :param datacube.index._api.Index index: An optional `index` object, if checking of field names is desired.
+        :param str product: name of product
+        :param datacube.model.GeoPolygon geopolygon: spatial bounds of the search
+        :param xarray.Dataset like: spatio-temporal bounds of `like` are used for the search
         :param kwargs:
-         * `product` Name of the dataset type
-         * `crs` Spatial coordinate reference system to interpret the spatial dimensions
-        :return: :class:`Query`
+         * `measurements` - list of measurements to retrieve
+         * `latitude`, `lat`, `y`, `longitude`, `lon`, `long`, `x` - tuples (min, max) bounding spatial dimensions
+         * `crs` - spatial coordinate reference system to interpret the spatial bounds
+         * `group_by` - observation grouping method. One of 'time', 'solar_day'. Default is 'time'
         """
         self.product = product
-        self.geopolygon = query_geopolygon(geopolygon=geopolygon, **kwargs) or query_geopolygon_like(like)
+        self.geopolygon = query_geopolygon(geopolygon=geopolygon, **kwargs)
 
         remaining_keys = set(kwargs.keys()) - set(SPATIAL_KEYS + CRS_KEYS + OTHER_KEYS)
         if index:
@@ -60,10 +65,21 @@ class Query(object):
                 raise LookupError('Unknown arguments: ', unknown_keys)
 
         self.search = {}
-        if like:
-            self.search.update(_like_to_search(like))
         for key in remaining_keys:
             self.search.update(_values_to_search(**{key: kwargs[key]}))
+
+        if like:
+            assert self.geopolygon is None, "'like' with other spatial bounding parameters is not supported"
+            self.geopolygon = getattr(like, 'extent', self.geopolygon)
+
+            if 'time' not in self.search:
+                time_coord = like.coords.get('time')
+                if time_coord is not None:
+                    self.search['time'] = _time_to_search_dims(
+                        (pandas_to_datetime(time_coord.values[0]).to_pydatetime(),
+                         pandas_to_datetime(time_coord.values[-1]).to_pydatetime()
+                         + datetime.timedelta(milliseconds=1))
+                    )
 
     @property
     def search_terms(self):
@@ -151,25 +167,6 @@ def query_geopolygon(geopolygon=None, **kwargs):
         raise ValueError('Cannot specify "geopolygon" and one of %s at the same time' % (SPATIAL_KEYS + CRS_KEYS))
 
     return geopolygon or _range_to_geopolygon(**spatial_dims)
-
-
-def query_geopolygon_like(dataset):
-    if dataset is None:
-        return None
-    return getattr(dataset, 'extent')
-
-
-def query_resolution_like(dataset):
-    if dataset is None:
-        return None
-    affine = dataset.affine
-    return affine.e, affine.a
-
-
-def query_crs_like(dataset):
-    if dataset is None:
-        return None
-    return dataset.data_vars.values()[0].attrs.get('crs')
 
 
 def query_group_by(group_by='time', **kwargs):
@@ -273,12 +270,7 @@ def _to_datetime(t):
             t = t.replace(tzinfo=tz.tzutc())
         return t
 
-    try:
-        from pandas import to_datetime as pandas_to_datetime
-        return pandas_to_datetime(t, utc=True, infer_datetime_format=True).to_pydatetime()
-    except ImportError:
-        pass
-    raise ValueError('Could not parse the time for {}'.format(t))
+    return pandas_to_datetime(t, utc=True, infer_datetime_format=True).to_pydatetime()
 
 
 def _time_to_search_dims(time_range):
@@ -306,14 +298,3 @@ def solar_day(dataset):
     longitude = (bb.left + bb.right) * 0.5
     solar_time = _convert_to_solar_time(utc, longitude)
     return np.datetime64(solar_time.date(), 'D')
-
-
-def _like_to_search(dataset):
-    search = {}
-    for name, coord in dataset.coords.items():
-        if name == 'time':
-            search['time'] = _time_to_search_dims((coord[0].values,
-                                                   coord[-1].values + datetime.timedelta(milliseconds=1)))
-        elif name not in SPATIAL_KEYS:
-            search[name] = Range(dataset.coords[0].values, dataset.coords[-1].values)
-    return search

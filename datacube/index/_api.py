@@ -1,6 +1,6 @@
 # coding=utf-8
 """
-Access methods for indexing datasets & storage units.
+Access methods for indexing datasets & products.
 """
 from __future__ import absolute_import
 
@@ -24,7 +24,7 @@ def connect(local_config=None, application_name=None, validate_connection=True):
     :param application_name: A short, alphanumeric name to identify this application.
     :param local_config: Config object to use.
     :type local_config: :py:class:`datacube.config.LocalConfig`, optional
-    :param validate_connection: Validate database schema and schema version is correct
+    :param validate_connection: Validate database connection and schema immediately
     :rtype: Index
     :raises datacube.index.postgres._api.EnvironmentError:
     """
@@ -32,12 +32,26 @@ def connect(local_config=None, application_name=None, validate_connection=True):
         local_config = LocalConfig.find()
 
     return Index(
-        PostgresDb.from_config(local_config, application_name=application_name, validate_db=validate_connection)
+        PostgresDb.from_config(local_config, application_name=application_name, validate_connection=validate_connection)
     )
 
 
 class Index(object):
     """
+    Access to the datacube index.
+
+    Thread safe. But not multiprocess safe once a connection is made (db connections cannot be shared between processes)
+    You can close idle connections before forking by calling close(), provided you know no other connections are active.
+    Or else use a separate instance of this class in each process.
+
+    :ivar datacube.index._datasets.DatasetResource datasets: store and retrieve :class:`datacube.model.Dataset`
+    :ivar datacube.index._datasets.DatasetTypeResource products: store and retrieve :class:`datacube.model.DatasetType`\
+    (should really be called Product)
+    :ivar datacube.index._datasets.MetadataTypeResource metadata_types: store and retrieve \
+    :class:`datacube.model.MetadataType`
+    :ivar UserResource users: user management
+
+    :type users: UserResource
     :type datasets: datacube.index._datasets.DatasetResource
     :type products: datacube.index._datasets.DatasetTypeResource
     :type metadata_types: datacube.index._datasets.MetadataTypeResource
@@ -48,6 +62,7 @@ class Index(object):
         """
         self._db = db
 
+        self.users = UserResource(db)
         self.metadata_types = MetadataTypeResource(db)
         self.products = DatasetTypeResource(db, self.metadata_types)
         self.datasets = DatasetResource(db, self.products)
@@ -61,6 +76,31 @@ class Index(object):
                 self.metadata_types.add(doc, allow_table_lock=True)
 
         return is_new
+
+    def close(self):
+        """
+        Close any idle connections database connections.
+
+        This is good practice if you are keeping the Index instance in scope
+        but wont be using it for a while.
+
+        (Connections are normally closed automatically when this object is deleted: ie. no references exist)
+        """
+        self._db.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type_, value, traceback):
+        self.close()
+
+    def __repr__(self):
+        return "Index<db={!r}>".format(self._db)
+
+
+class UserResource(object):
+    def __init__(self, db):
+        self._db = db
 
     def grant_role(self, role, *users):
         """
@@ -86,6 +126,3 @@ class Index(object):
         :rtype: list[(str, str, str)]
         """
         return self._db.list_users()
-
-    def __repr__(self):
-        return "Index<db={!r}>".format(self._db)

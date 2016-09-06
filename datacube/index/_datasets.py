@@ -6,13 +6,13 @@ from __future__ import absolute_import
 
 import logging
 
-import cachetools
+from cachetools import lru_cache
 
 from datacube import compat
 from datacube.model import Dataset, DatasetType, MetadataType
-from datacube.utils import InvalidDocException, check_doc_unchanged, jsonify_document
+from datacube.utils import InvalidDocException, check_doc_unchanged, jsonify_document, get_doc_changes, contains
 from . import fields
-from .exceptions import DuplicateRecordError
+from .exceptions import DuplicateRecordError, UnknownFieldError
 
 _LOG = logging.getLogger(__name__)
 
@@ -56,17 +56,17 @@ class MetadataTypeResource(object):
             )
         return self.get_by_name(name)
 
-    @cachetools.cached(cachetools.TTLCache(100, 60))
+    @lru_cache()
     def get(self, id_):
         """
-        :rtype datacube.model.MetadataType
+        :rtype: datacube.model.MetadataType
         """
         return self._make(self._db.get_metadata_type(id_))
 
-    @cachetools.cached(cachetools.TTLCache(100, 60))
+    @lru_cache()
     def get_by_name(self, name):
         """
-        :rtype datacube.model.MetadataType
+        :rtype: datacube.model.MetadataType
         """
         record = self._db.get_metadata_type_by_name(name)
         if not record:
@@ -117,7 +117,9 @@ class DatasetTypeResource(object):
 
     def from_doc(self, definition):
         """
-        :type definition: dict
+        Create a Product from its definitions
+
+        :param dict definition: product definition document
         :rtype: datacube.model.DatasetType
         """
         # This column duplication is getting out of hand:
@@ -140,7 +142,9 @@ class DatasetTypeResource(object):
 
     def add(self, type_):
         """
-        :type type_: datacube.model.DatasetType
+        Add a Product
+
+        :param datacube.model.DatasetType type_: Product to add
         :rtype: datacube.model.DatasetType
         """
         DatasetType.validate(type_.definition)
@@ -151,7 +155,7 @@ class DatasetTypeResource(object):
             # They've passed us the same collection again. Make sure it matches what is stored.
             check_doc_unchanged(
                 existing.definition,
-                type_.definition,
+                jsonify_document(type_.definition),
                 'Dataset type {}'.format(type_.name)
             )
         else:
@@ -163,32 +167,99 @@ class DatasetTypeResource(object):
             )
         return self.get_by_name(type_.name)
 
+    def update(self, type_, allow_unsafe_updates=False):
+        """
+        Update a product. Unsafe changes will throw a ValueError by default.
+
+        (An unsafe change is anything that may potentially make the product
+        incompatible with existing datasets of that type)
+
+        :param datacube.model.DatasetType type_: Product to add
+        :param allow_unsafe_updates bool: Allow unsafe changes. Use with caution.
+        :rtype: datacube.model.DatasetType
+        """
+        DatasetType.validate(type_.definition)
+
+        existing = self._db.get_dataset_type_by_name(type_.name)
+        if not existing:
+            raise ValueError('Unknown product %s, cannot update – did you intend to add it?' % type_.name)
+
+        def handle_unsafe(msg):
+            if not allow_unsafe_updates:
+                raise ValueError(msg)
+            else:
+                _LOG.warning("Ignoring %s", msg)
+
+        # We'll probably want to use offsets in the future (ie. nested dicts), not just keys, but for now this suffices.
+        safe_keys_to_change = ('description', 'metadata')
+
+        doc_changes = get_doc_changes(existing.definition, jsonify_document(type_.definition))
+        for offset, old_value, new_value in doc_changes:
+            _LOG.info('Changing %s %s: %r -> %r', type_.name, '.'.join(offset), old_value, new_value)
+
+            key_name = offset[0]
+            if key_name not in safe_keys_to_change:
+                handle_unsafe('Potentially unsafe update: changing %r of product definition.' % key_name)
+
+            # You can safely make the match rules looser but not tighter.
+            if key_name == 'metadata':
+                # Tightening them could exclude datasets already matched to the product.
+                # (which would make search results wrong)
+                if not contains(old_value, new_value, case_sensitive=True):
+                    handle_unsafe('Unsafe update: new product match rules are not a superset of old ones.')
+
+        if doc_changes:
+            _LOG.info("Updating product %s", type_.name)
+            self._db.update_dataset_type(
+                name=type_.name,
+                metadata=type_.metadata_doc,
+                metadata_type_id=type_.metadata_type.id,
+                definition=type_.definition
+            )
+            # Clear our local cache. Note that other users may still have
+            # cached copies for the duration of their connections.
+            self.get_by_name.cache_clear()
+            self.get.cache_clear()
+        else:
+            _LOG.info("No changes detected for product %s", type_.name)
+
+    def update_document(self, definition, allow_unsafe_update=False):
+        """
+        Update a Product using its difinition
+
+        :param dict definition: product definition document
+        :rtype: datacube.model.DatasetType
+        """
+        type_ = self.from_doc(definition)
+        return self.update(type_, allow_unsafe_updates=allow_unsafe_update)
+
     def add_document(self, definition):
         """
-        :type definition: dict
+        Add a Product using its difinition
+
+        :param dict definition: product definition document
         :rtype: datacube.model.DatasetType
         """
         type_ = self.from_doc(definition)
         return self.add(type_)
 
-    def add_many(self, definitions):
-        """
-        :type definitions: list[dict]
-        """
-        for definition in definitions:
-            self.add_document(definition)
-
-    @cachetools.cached(cachetools.TTLCache(100, 60))
+    @lru_cache()
     def get(self, id_):
         """
-        :rtype datacube.model.DatasetType
+        Retrieve Product by id
+
+        :param int id_: id of the Product
+        :rtype: datacube.model.DatasetType
         """
         return self._make(self._db.get_dataset_type(id_))
 
-    @cachetools.cached(cachetools.TTLCache(100, 60))
+    @lru_cache()
     def get_by_name(self, name):
         """
-        :rtype datacube.model.DatasetType
+        Retrieve Product by name
+
+        :param str name: name of the Product
+        :rtype: datacube.model.DatasetType
         """
         result = self._db.get_dataset_type_by_name(name)
         if not result:
@@ -198,7 +269,8 @@ class DatasetTypeResource(object):
     def get_with_fields(self, field_names):
         """
         Return dataset types that have all the given fields.
-        :type field_names: tuple[str]
+
+        :param tuple[str] field_names:
         :rtype: __generator[DatasetType]
         """
         for type_ in self.get_all():
@@ -211,15 +283,48 @@ class DatasetTypeResource(object):
     def search(self, **query):
         """
         Return dataset types that have all the given fields.
-        :type query: dict
+
+        :param dict query:
         :rtype: __generator[DatasetType]
         """
-        for type_ in self.get_all():
-            if type_.matches(**query):
+        for type_, q in self.search_robust(**query):
+            if not q:
                 yield type_
+
+    def search_robust(self, **query):
+        """
+        Return dataset types that match match-able fields and dict of remaining un-matchable fields.
+
+        :param dict query:
+        :rtype: __generator[(DatasetType, dict)]
+        """
+        for type_ in self.get_all():
+            q = query.copy()
+            if q.pop('product', type_.name) != type_.name:
+                continue
+            if q.pop('metadata_type', type_.metadata_type.name) != type_.metadata_type.name:
+                continue
+
+            for key, value in list(q.items()):
+                try:
+                    exprs = fields.to_expressions(type_.metadata_type.dataset_fields.get, **{key: value})
+                except UnknownFieldError as e:
+                    break
+
+                try:
+                    if all(expr.evaluate(type_.metadata_doc) for expr in exprs):
+                        q.pop(key)
+                    else:
+                        break
+                except (AttributeError, KeyError, ValueError) as e:
+                    continue
+            else:
+                yield type_, q
 
     def get_all(self):
         """
+        Retrieve all Products
+
         :rtype: iter[datacube.model.DatasetType]
         """
         return (self._make(record) for record in self._db.get_all_dataset_types())
@@ -256,13 +361,15 @@ class DatasetResource(object):
         """
         Get dataset by id
 
-        :param include_sources: get the full provenance graph?
+        :param uuid id_: id of the dataset to retrieve
+        :param bool include_sources: get the full provenance graph?
         :rtype: datacube.model.Dataset
         """
         if not include_sources:
-            return self._make(self._db.get_dataset(id_))
+            return self._make(self._db.get_dataset(id_), full_info=True)
 
-        datasets = {result['id']: (self._make(result), result) for result in self._db.get_dataset_sources(id_)}
+        datasets = {result['id']: (self._make(result, full_info=True), result)
+                    for result in self._db.get_dataset_sources(id_)}
         for dataset, result in datasets.values():
             dataset.metadata_doc['lineage']['source_datasets'] = {
                 classifier: datasets[str(source)][0].metadata_doc
@@ -287,7 +394,7 @@ class DatasetResource(object):
         """
         Have we already indexed this dataset?
 
-        :type dataset: datacube.model.Dataset
+        :param datacube.model.Dataset dataset: dataset to check
         :rtype: bool
         """
         return self._db.contains_dataset(dataset.id)
@@ -296,8 +403,8 @@ class DatasetResource(object):
         """
         Ensure a dataset is in the index. Add it if not present.
 
-        :type dataset: datacube.model.Dataset
-        :param bool skip_sources: use when sources are already indexed
+        :param datacube.model.Dataset dataset: dataset to add
+        :param bool skip_sources: don't attempt to index source (use when sources are already indexed)
         :rtype: datacube.model.Dataset
         """
         if not skip_sources:
@@ -311,15 +418,15 @@ class DatasetResource(object):
             _LOG.info('Indexing %s', dataset.id)
             with self._db.begin() as transaction:
                 try:
-                    was_inserted = self._db.insert_dataset(dataset.metadata_doc, dataset.id, dataset.type.id)
+                    was_inserted = transaction.insert_dataset(dataset.metadata_doc, dataset.id, dataset.type.id)
                     for classifier, source_dataset in dataset.sources.items():
-                        self._db.insert_dataset_source(classifier, dataset.id, source_dataset.id)
+                        transaction.insert_dataset_source(classifier, dataset.id, source_dataset.id)
 
                     # try to update location in the same transaction as insertion.
                     # if insertion fails we'll try updating location later
                     # if insertion succeeds the location bit can't possibly fail
                     if dataset.local_uri:
-                        self._db.ensure_dataset_location(dataset.id, dataset.local_uri)
+                        transaction.ensure_dataset_location(dataset.id, dataset.local_uri)
                 except DuplicateRecordError as e:
                     _LOG.warning(str(e))
 
@@ -351,7 +458,7 @@ class DatasetResource(object):
         """
         with self._db.begin() as transaction:
             for id_ in ids:
-                self._db.archive_dataset(id_)
+                transaction.archive_dataset(id_)
 
     def restore(self, ids):
         """
@@ -361,11 +468,11 @@ class DatasetResource(object):
         """
         with self._db.begin() as transaction:
             for id_ in ids:
-                self._db.restore_dataset(id_)
+                transaction.restore_dataset(id_)
 
     def get_field_names(self, type_name=None):
         """
-        :type type_name: str
+        :param str type_name:
         :rtype: __generator[str]
         """
         if type_name is None:
@@ -379,19 +486,23 @@ class DatasetResource(object):
 
     def get_locations(self, dataset):
         """
-        :type dataset: datacube.model.Dataset
+        :param datacube.model.Dataset dataset: dataset
         :rtype: list[str]
         """
         return self._db.get_locations(dataset.id)
 
-    def _make(self, dataset_res):
+    def _make(self, dataset_res, full_info=False):
         """
         :rtype datacube.model.Dataset
+
+        :param bool full_info: Include all available fields
         """
         return Dataset(
             self.types.get(dataset_res.dataset_type_ref),
             dataset_res.metadata,
-            dataset_res.local_uri
+            dataset_res.local_uri,
+            indexed_by=dataset_res.added_by if full_info else None,
+            indexed_time=dataset_res.added if full_info else None
         )
 
     def _make_many(self, query_result):
@@ -406,7 +517,7 @@ class DatasetResource(object):
 
         Caution – slow! This will usually not use indexes.
 
-        :type metadata: dict
+        :param dict metadata:
         :rtype: list[datacube.model.Dataset]
         """
         return self._make_many(self._db.search_datasets_by_metadata(metadata))
@@ -414,29 +525,57 @@ class DatasetResource(object):
     def search(self, **query):
         """
         Perform a search, returning results as Dataset objects.
-        :type query: dict[str,str|float|datacube.model.Range]
+
+        :param dict[str,str|float|datacube.model.Range] query:
         :rtype: __generator[datacube.model.Dataset]
         """
-        return self._make_many(self._do_search(query))
+        for dataset_type, datasets in self._do_search_by_product(query):
+            for dataset in self._make_many(datasets):
+                yield dataset
+
+    def search_by_product(self, **query):
+        """
+        Perform a search, returning datasets grouped by product type.
+
+        :param dict[str,str|float|datacube.model.Range] query:
+        :rtype: __generator[(datacube.model.DatasetType,  __generator[datacube.model.Dataset])]]
+        """
+        for dataset_type, datasets in self._do_search_by_product(query):
+            yield dataset_type, self._make_many(datasets)
 
     def count(self, **query):
         """
         Perform a search, returning count of results.
-        :type query: dict[str,str|float|datacube.model.Range]
+
+        :param dict[str,str|float|datacube.model.Range] query:
         :rtype: int
         """
-        return self._do_count(query)
+        # This may be optimised into one query in the future.
+        result = 0
+        for product_type, count in self._do_count_by_product(query):
+            result += count
+
+        return result
+
+    def count_by_product(self, **query):
+        """
+        Perform a search, returning a count of for each matching product type.
+
+        :param dict[str,str|float|datacube.model.Range] query:
+        :returns: Sequence of (product, count)
+        :rtype: __generator[(datacube.model.DatasetType,  int)]]
+        """
+        return self._do_count_by_product(query)
 
     def count_by_product_through_time(self, period, **query):
         """
         Perform a search, returning counts for each product grouped in time slices
         of the given period.
 
-        :type query: dict[str,str|float|datacube.model.Range]
-        :type period: str
-        :param period: Time range for each slice: '1 month', '1 day' etc.
+        :param dict[str,str|float|datacube.model.Range] query:
+        :param str period: Time range for each slice: '1 month', '1 day' etc.
         :returns: For each matching product type, a list of time ranges and their count.
-        :rtype: __generator[(str, list[(datetime.datetime, datetime.datetime), int)]]
+        :rtype: __generator[(datacube.model.DatasetType, list[(datetime.datetime, datetime.datetime), int)]]
         """
         return self._do_time_count(period, query)
 
@@ -447,9 +586,8 @@ class DatasetResource(object):
 
         Will raise an error if the search terms match more than one product.
 
-        :type query: dict[str,str|float|datacube.model.Range]
-        :type period: str
-        :param period: Time range for each slice: '1 month', '1 day' etc.
+        :param dict[str,str|float|datacube.model.Range] query:
+        :param str period: Time range for each slice: '1 month', '1 day' etc.
         :returns: For each matching product type, a list of time ranges and their count.
         :rtype: list[(str, list[(datetime.datetime, datetime.datetime), int)]]
         """
@@ -468,37 +606,31 @@ class DatasetResource(object):
         return types
 
     def _get_product_queries(self, query):
-        dataset_types = self.types.search(**query)
-        for dataset_type in dataset_types:
-            q = dict(query)
-            # We've already matched all fixed fields for the product (in the above types.search())
-            for field_name in dataset_type.fixed_fields.keys():
-                if field_name in q:
-                    del q[field_name]
+        for dataset_type, q in self.types.search_robust(**query):
             q['dataset_type_id'] = dataset_type.id
-
             yield q, dataset_type
 
-    def _do_search(self, query, return_fields=False, with_source_ids=False):
+    def _do_search_by_product(self, query, return_fields=False, with_source_ids=False):
         for q, dataset_type in self._get_product_queries(query):
             dataset_fields = dataset_type.metadata_type.dataset_fields
             query_exprs = tuple(fields.to_expressions(dataset_fields.get, **q))
             select_fields = None
             if return_fields:
                 select_fields = tuple(dataset_fields.values())
-            for dataset in self._db.search_datasets(query_exprs,
-                                                    select_fields=select_fields,
-                                                    with_source_ids=with_source_ids):
-                yield dataset
+            yield (dataset_type,
+                   self._db.search_datasets(
+                       query_exprs,
+                       select_fields=select_fields,
+                       with_source_ids=with_source_ids
+                   ))
 
-    def _do_count(self, query):
-        result = 0
-
+    def _do_count_by_product(self, query):
         for q, dataset_type in self._get_product_queries(query):
             dataset_fields = dataset_type.metadata_type.dataset_fields
             query_exprs = tuple(fields.to_expressions(dataset_fields.get, **q))
-            result += self._db.count_datasets(query_exprs)
-        return result
+            count = self._db.count_datasets(query_exprs)
+            if count > 0:
+                yield dataset_type, count
 
     def _do_time_count(self, period, query, ensure_single=False):
         if 'time' not in query:
@@ -520,7 +652,7 @@ class DatasetResource(object):
         for q, dataset_type in product_quries:
             dataset_fields = dataset_type.metadata_type.dataset_fields
             query_exprs = tuple(fields.to_expressions(dataset_fields.get, **q))
-            yield dataset_type.name, list(self._db.count_datasets_through_time(
+            yield dataset_type, list(self._db.count_datasets_through_time(
                 start,
                 end,
                 period,
@@ -532,20 +664,18 @@ class DatasetResource(object):
         """
         Perform a search, returning just the search fields of each dataset.
 
-        :type query: dict[str,str|float|datacube.model.Range]
+        :param dict[str,str|float|datacube.model.Range] query:
         :rtype: dict
         """
-        return (
-            dict(fs) for fs in
-            self._do_search(
-                query,
-                return_fields=True
-            )
-        )
+        for dataset_type, results in self._do_search_by_product(query, return_fields=True):
+            for columns in results:
+                yield dict(columns)
 
     def search_eager(self, **query):
         """
-        :type query: dict[str,str|float|datacube.model.Range]
+        Perform a search, returning results as Dataset objects.
+
+        :param dict[str,str|float|datacube.model.Range] query:
         :rtype: list[datacube.model.Dataset]
         """
         return list(self.search(**query))

@@ -51,28 +51,45 @@ def test_metadata_indexes_views_exist(db, default_metadata_type):
     :type default_metadata_type: datacube.model.MetadataType
     """
     # Ensure indexes were created for the eo metadata type (following the naming conventions):
-    val = db._connection.execute(
-        "SELECT to_regclass('agdc.dix_eo_platform')").scalar()
-    assert val == 'agdc.dix_eo_platform'
+    assert _object_exists(db, 'dix_eo_platform')
 
     # Ensure view was created (following naming conventions)
-    val = db._connection.execute("SELECT to_regclass('agdc.dv_eo_dataset')").scalar()
-    assert val == 'agdc.dv_eo_dataset'
+    assert _object_exists(db, 'dv_eo_dataset')
 
 
 def test_dataset_indexes_views_exist(db, ls5_nbar_gtiff_type):
     """
     :type db: datacube.index.postgres._api.PostgresDb
-    :type default_metadata_type: datacube.model.MetadataType
+    :type ls5_nbar_gtiff_type: datacube.model.DatasetType
     """
-    # Ensure indexes were created for the dataset type (following the naming conventions):
-    val = db._connection.execute(
-        "SELECT to_regclass('agdc.dix_ls5_nbart_p54_gtiff_platform')").scalar()
-    assert val == 'agdc.dix_ls5_nbart_p54_gtiff_platform'
+    assert ls5_nbar_gtiff_type.name == 'ls5_nbart_p54_gtiff'
+
+    # Ensure field indexes were created for the dataset type (following the naming conventions):
+    assert _object_exists(db, "dix_ls5_nbart_p54_gtiff_orbit")
+
+    # Ensure it does not create a 'platform' index, because that's a fixed field
+    # (ie. identical in every dataset of the type)
+    assert not _object_exists(db, "dix_ls5_nbart_p54_gtiff_platform")
 
     # Ensure view was created (following naming conventions)
-    val = db._connection.execute("SELECT to_regclass('agdc.dv_ls5_nbart_p54_gtiff_dataset')").scalar()
-    assert val == 'agdc.dv_ls5_nbart_p54_gtiff_dataset'
+    assert _object_exists(db, 'dv_ls5_nbart_p54_gtiff_dataset')
+
+
+def test_dataset_conposit_indexes_exist(db, ls5_nbar_gtiff_type):
+    # This type has fields named lat/lon/time, so composite indexes should now exist for them:
+    # (following the naming conventions)
+    assert _object_exists(db, "dix_ls5_nbart_p54_gtiff_time_lat_lon")
+    assert _object_exists(db, "dix_ls5_nbart_p54_gtiff_lat_lon_time")
+
+    # But no individual field indexes for these
+    assert not _object_exists(db, "dix_ls5_nbart_p54_gtiff_lat")
+    assert not _object_exists(db, "dix_ls5_nbart_p54_gtiff_lon")
+    assert not _object_exists(db, "dix_ls5_nbart_p54_gtiff_time")
+
+
+def _object_exists(db, index_name):
+    val = db._connection.execute("SELECT to_regclass('agdc.%s')" % index_name).scalar()
+    return val == ('agdc.%s' % index_name)
 
 
 def test_idempotent_add_dataset_type(index, ls5_nbar_gtiff_type, ls5_nbar_gtiff_doc):
@@ -94,6 +111,42 @@ def test_idempotent_add_dataset_type(index, ls5_nbar_gtiff_type, ls5_nbar_gtiff_
         # TODO: Support for adding/changing search fields?
 
 
+def test_update_dataset_type(index, ls5_nbar_gtiff_type, ls5_nbar_gtiff_doc):
+    """
+    :type ls5_nbar_gtiff_type: datacube.model.DatasetType
+    :type index: datacube.index._api.Index
+    """
+    assert index.datasets.types.get_by_name(ls5_nbar_gtiff_type.name) is not None
+
+    # Update with a new description
+    ls5_nbar_gtiff_doc['description'] = "New description"
+    index.datasets.types.update_document(ls5_nbar_gtiff_doc)
+    # Ensure was updated
+    assert index.datasets.types.get_by_name(ls5_nbar_gtiff_type.name).definition['description'] == "New description"
+
+    # Remove some match rules (looser rules -- that match more datasets -- should be allowed)
+    assert 'format' in ls5_nbar_gtiff_doc['metadata']
+    del ls5_nbar_gtiff_doc['metadata']['format']['name']
+    del ls5_nbar_gtiff_doc['metadata']['format']
+
+    index.datasets.types.update_document(ls5_nbar_gtiff_doc)
+    # Ensure was updated
+    updated_type = index.datasets.types.get_by_name(ls5_nbar_gtiff_type.name)
+    assert updated_type.definition['metadata'] == ls5_nbar_gtiff_doc['metadata']
+
+    # But if we make metadata more restrictive we get an error:
+    different_telemetry_type = copy.deepcopy(ls5_nbar_gtiff_doc)
+    assert 'ga_label' not in different_telemetry_type['metadata']
+    different_telemetry_type['metadata']['ga_label'] = 'something'
+    with pytest.raises(ValueError):
+        index.datasets.types.update_document(different_telemetry_type)
+
+    # But works when unsafe updates are allowed.
+    index.datasets.types.update_document(different_telemetry_type, allow_unsafe_update=True)
+    updated_type = index.datasets.types.get_by_name(ls5_nbar_gtiff_type.name)
+    assert updated_type.definition['metadata']['ga_label'] == 'something'
+
+
 def test_filter_types_by_fields(index, ls5_nbar_gtiff_type):
     """
     :type ls5_nbar_gtiff_type: datacube.model.DatasetType
@@ -105,15 +158,6 @@ def test_filter_types_by_fields(index, ls5_nbar_gtiff_type):
 
     res = list(index.datasets.types.get_with_fields(['lat', 'lon', 'platform', 'favorite_icecream']))
     assert len(res) == 0
-
-
-def test_fixed_fields(ls5_nbar_gtiff_type):
-    assert set(ls5_nbar_gtiff_type.fixed_fields.keys()) == {
-        # Native fields
-        'product', 'metadata_type',
-        # Doc fields
-        'platform', 'format', 'product_type'
-    }
 
 
 def test_filter_types_by_search(index, ls5_nbar_gtiff_type):
@@ -134,25 +178,34 @@ def test_filter_types_by_search(index, ls5_nbar_gtiff_type):
     ))
     assert res == [ls5_nbar_gtiff_type]
 
-    # Matching fields and available fields
+    # Matching fields and non-available fields
     res = list(index.datasets.types.search(
         product_type='nbart',
         product='ls5_nbart_p54_gtiff',
         lat=Range(142.015625, 142.015625),
         lon=Range(-12.046875, -12.046875)
     ))
+    assert res == []
+
+    # Matching fields and available fields
+    [(res, q)] = list(index.datasets.types.search_robust(
+        product_type='nbart',
+        product='ls5_nbart_p54_gtiff',
+        lat=Range(142.015625, 142.015625),
+        lon=Range(-12.046875, -12.046875)
+    ))
+    assert res == ls5_nbar_gtiff_type
+    assert 'lat' in q
+    assert 'lon' in q
+
+    # Or expression test
+    res = list(index.datasets.types.search(
+        product_type=['nbart', 'nbar'],
+    ))
     assert res == [ls5_nbar_gtiff_type]
 
     # Mismatching fields
     res = list(index.datasets.types.search(
         product_type='nbar',
-    ))
-    assert res == []
-
-    # Matching fields and non-available fields
-    res = list(index.datasets.types.search(
-        product_type='nbart',
-        product='ls5_nbart_p54_gtiff',
-        beverage='frappuccino'
     ))
     assert res == []

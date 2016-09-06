@@ -23,6 +23,7 @@ from sqlalchemy.engine.url import URL as EngineUrl
 from sqlalchemy.exc import IntegrityError
 
 import datacube
+from datacube.compat import string_types
 from datacube.config import LocalConfig
 from datacube.index.exceptions import DuplicateRecordError
 from datacube.index.fields import OrExpression
@@ -33,7 +34,6 @@ from ._fields import parse_fields, NativeField
 from .tables import DATASET, DATASET_SOURCE, METADATA_TYPE, DATASET_LOCATION, DATASET_TYPE
 
 _LIB_ID = 'agdc-' + str(datacube.__version__)
-APP_NAME_PATTERN = re.compile('^[a-zA-Z0-9-]+$')
 
 DATASET_URI_FIELD = DATASET_LOCATION.c.uri_scheme + ':' + DATASET_LOCATION.c.uri_body
 _DATASET_SELECT_FIELDS = (
@@ -84,21 +84,30 @@ class PostgresDb(object):
     It exists so that higher level modules are not tied to SQLAlchemy, connections or specifics of database-access.
 
     (and can be unit tested without any actual databases)
+
+    Thread safe: the only shared state is the (thread-safe) sqlalchemy connection pool.
+
+    But not multiprocess safe once the first connections are made! A connection must not be shared between multiple
+    processes. You can call close() before forking if you know no other threads currently hold connections,
+    or else use a separate instance of this class in each process.
     """
 
-    def __init__(self, engine, connection):
+    def __init__(self, engine):
+        # We don't recommend using this constructor directly as it may change.
+        # Use static methods PostgresDb.create() or PostgresDb.from_config()
         self._engine = engine
-        self._connection = connection
 
     @classmethod
-    def connect(cls, hostname, database, username=None, password=None, port=None, application_name=None, validate=True):
-        _engine = create_engine(
+    def create(cls, hostname, database, username=None, password=None, port=None, application_name=None, validate=True):
+        engine = create_engine(
             EngineUrl(
                 'postgresql',
                 host=hostname, database=database, port=port,
                 username=username, password=password,
             ),
             echo=False,
+            echo_pool=False,
+
             # 'AUTOCOMMIT' here means READ-COMMITTED isolation level with autocommit on.
             # When a transaction is needed we will do an explicit begin/commit.
             isolation_level='AUTOCOMMIT',
@@ -107,61 +116,81 @@ class PostgresDb(object):
             connect_args={'application_name': application_name}
         )
         if validate:
-            if not tables.database_exists(_engine):
+            if not tables.database_exists(engine):
                 raise IndexSetupError('\n\nNo DB schema exists. Have you run init?\n\t{init_command}'.format(
                     init_command='datacube system init'
                 ))
 
-            if not tables.schema_is_latest(_engine):
+            if not tables.schema_is_latest(engine):
                 raise IndexSetupError(
                     '\n\nDB schema is out of date. '
                     'An administrator must run init:\n\t{init_command}'.format(
                         init_command='datacube -v system init'
                     ))
-
-        _connection = _engine.connect()
-        return PostgresDb(_engine, _connection)
+        return PostgresDb(engine)
 
     @classmethod
-    def from_config(cls, config=LocalConfig.find(), application_name=None, validate_db=True):
+    def from_config(cls, config=LocalConfig.find(), application_name=None, validate_connection=True):
         app_name = cls._expand_app_name(application_name)
 
-        return PostgresDb.connect(
+        return PostgresDb.create(
             config.db_hostname,
             config.db_database,
             config.db_username,
             config.db_password,
             config.db_port,
             application_name=app_name,
-            validate=validate_db
+            validate=validate_connection
         )
+
+    @property
+    def _connection(self):
+        """
+        Borrow a connection from the pool.
+        """
+        return self._engine.connect()
+
+    def close(self):
+        """
+        Close any idle connections in the pool.
+
+        This is good practice if you are keeping this object in scope
+        but wont be using it for a while.
+
+        Connections should not be shared between processes, so this should be called
+        before forking if the same instance will be used.
+
+        (connections are normally closed automatically when this object is
+         garbage collected)
+        """
+        self._engine.dispose()
 
     @classmethod
     def _expand_app_name(cls, application_name):
         """
         >>> PostgresDb._expand_app_name(None) #doctest: +ELLIPSIS
         'agdc-...'
+        >>> PostgresDb._expand_app_name('') #doctest: +ELLIPSIS
+        'agdc-...'
         >>> PostgresDb._expand_app_name('cli') #doctest: +ELLIPSIS
         'cli agdc-...'
-        >>> PostgresDb._expand_app_name('not valid')
+        >>> PostgresDb._expand_app_name('a b.c/d')
+        'a-b-c-d agdc-...'
+        >>> PostgresDb._expand_app_name(5)
         Traceback (most recent call last):
         ...
-        ValueError: Invalid application name 'not valid': Must be alphanumeric with dashes.
-        >>> PostgresDb._expand_app_name('') #doctest: +ELLIPSIS
-        Traceback (most recent call last):
-        ...
-        ValueError: Invalid application name '': Must be alphanumeric with dashes.
+        TypeError: Application name must be a string
         """
         full_name = _LIB_ID
-        if application_name is not None:
-            if not APP_NAME_PATTERN.match(application_name):
-                raise ValueError('Invalid application name %r: Must be alphanumeric with dashes.' % application_name)
+        if application_name:
+            if not isinstance(application_name, string_types):
+                raise TypeError('Application name must be a string')
 
-            full_name = application_name + ' ' + _LIB_ID
+            full_name = re.sub('[^0-9a-zA-Z]+', '-', application_name) + ' ' + full_name
 
         if len(full_name) > 64:
-            raise ValueError('Application name is too long: Maximum %s chars' % (64 - len(_LIB_ID)))
-        return full_name
+            _LOG.warning('Application name is too long: Truncating to %s chars', (64 - len(_LIB_ID) - 1))
+        return full_name[-64:]
 
     def init(self, with_permissions=True):
         """
@@ -179,15 +208,16 @@ class PostgresDb(object):
         """
         Start a transaction.
 
-        Returns a transaction object. Call commit() or rollback() to complete the
-        transaction or use a context manager:
+        Returns an instance that will maintain a single connection in a transaction.
 
-            with db.begin() as transaction:
-                db.insert_dataset(...)
+        Call commit() or rollback() to complete the transaction or use a context manager:
 
-        :return: Tranasction object
+            with db.begin() as trans:
+                trans.insert_dataset(...)
+
+        :rtype: _PostgresDbInTransaction
         """
-        return _BegunTransaction(self._connection)
+        return _PostgresDbInTransaction(self._engine)
 
     def insert_dataset(self, metadata_doc, dataset_id, dataset_type_id):
         """
@@ -394,14 +424,17 @@ class PostgresDb(object):
             select(_DATASET_SELECT_FIELDS).where(DATASET.c.metadata.contains(metadata))
         ).fetchall()
 
-    def search_datasets(self, expressions, select_fields=None, with_source_ids=False):
-        """
-        :type with_source_ids: bool
-        :type select_fields: tuple[datacube.index.postgres._fields.PgField]
-        :type expressions: tuple[datacube.index.postgres._fields.PgExpression]
-        :rtype: dict
-        """
+    @staticmethod
+    def _alchemify_expressions(expressions):
+        def raw_expr(expression):
+            if isinstance(expression, OrExpression):
+                return or_(raw_expr(expr) for expr in expression.exprs)
+            return expression.alchemy_expression
 
+        return [raw_expr(expression) for expression in expressions]
+
+    @staticmethod
+    def search_datasets_query(expressions, select_fields=None, with_source_ids=False):
         if select_fields:
             select_columns = tuple(
                 f.alchemy_expression.label(f.name)
@@ -424,23 +457,28 @@ class PostgresDb(object):
                 ).label('dataset_refs'),
             )
 
-        def raw_expr(expression):
-            if isinstance(expression, OrExpression):
-                return or_(raw_expr(expr) for expr in expression.exprs)
-            return expression.alchemy_expression
-
-        raw_expressions = [raw_expr(expression) for expression in expressions]
+        raw_expressions = PostgresDb._alchemify_expressions(expressions)
 
         select_query = (
             select(
                 select_columns
             ).select_from(
-                self._from_expression(DATASET, expressions)
+                PostgresDb._from_expression(DATASET, expressions, select_fields)
             ).where(
                 and_(DATASET.c.archived == None, *raw_expressions)
             )
         )
 
+        return select_query
+
+    def search_datasets(self, expressions, select_fields=None, with_source_ids=False):
+        """
+        :type with_source_ids: bool
+        :type select_fields: tuple[datacube.index.postgres._fields.PgField]
+        :type expressions: tuple[datacube.index.postgres._fields.PgExpression]
+        :rtype: dict
+        """
+        select_query = self.search_datasets_query(expressions, select_fields, with_source_ids)
         results = self._connection.execute(select_query)
         for result in results:
             yield result
@@ -451,12 +489,7 @@ class PostgresDb(object):
         :rtype: int
         """
 
-        def raw_expr(expression):
-            if isinstance(expression, OrExpression):
-                return or_(raw_expr(expr) for expr in expression.exprs)
-            return expression.alchemy_expression
-
-        raw_expressions = [raw_expr(expression) for expression in expressions]
+        raw_expressions = self._alchemify_expressions(expressions)
 
         select_query = (
             select(
@@ -479,12 +512,7 @@ class PostgresDb(object):
         :rtype: list[((datetime.datetime, datetime.datetime), int)]
         """
 
-        def raw_expr(expression):
-            if isinstance(expression, OrExpression):
-                return or_(raw_expr(expr) for expr in expression.exprs)
-            return expression.alchemy_expression
-
-        raw_expressions = [raw_expr(expression) for expression in expressions]
+        raw_expressions = self._alchemify_expressions(expressions)
 
         start_times = select((
             func.generate_series(start, end, cast(period, INTERVAL)).label('start_time'),
@@ -531,11 +559,20 @@ class PostgresDb(object):
             # if not time_period.upper_inf:
             yield Range(time_period.lower, time_period.upper), dataset_count
 
-    def _from_expression(self, source_table, expressions):
-        join_tables = set([expression.field.required_alchemy_table for expression in expressions])
+    @staticmethod
+    def _from_expression(source_table, expressions=None, fields=None):
+        join_tables = set()
+        if expressions:
+            join_tables.update(expression.field.required_alchemy_table for expression in expressions)
+        if fields:
+            join_tables.update(field.required_alchemy_table for field in fields)
+        join_tables.discard(source_table)
+
+        table_order_hack = [DATASET_SOURCE, DATASET_LOCATION, DATASET, DATASET_TYPE, METADATA_TYPE]
+
         from_expression = source_table
-        for table in join_tables:
-            if table != source_table:
+        for table in table_order_hack:
+            if table in join_tables:
                 from_expression = from_expression.join(table)
         return from_expression
 
@@ -563,9 +600,7 @@ class PostgresDb(object):
                          name,
                          metadata,
                          metadata_type_id,
-                         definition, concurrently=False):
-
-        metadata_type_record = self.get_metadata_type(metadata_type_id)
+                         definition, concurrently=True):
 
         res = self._connection.execute(
             DATASET_TYPE.insert().values(
@@ -579,11 +614,29 @@ class PostgresDb(object):
         type_id = res.inserted_primary_key[0]
 
         # Initialise search fields.
-        _setup_collection_fields(
-            self._connection, name, self.get_dataset_fields(metadata_type_record),
-            where_expression=and_(DATASET.c.archived == None, DATASET.c.dataset_type_ref == type_id),
-            concurrently=concurrently
+        self._setup_dataset_type_fields(type_id, name, metadata_type_id, definition['metadata'],
+                                        concurrently=concurrently)
+        return type_id
+
+    def update_dataset_type(self,
+                            name,
+                            metadata,
+                            metadata_type_id,
+                            definition, concurrently=False):
+        res = self._connection.execute(
+            DATASET_TYPE.update().returning(DATASET_TYPE.c.id).where(
+                DATASET_TYPE.c.name == name
+            ).values(
+                metadata=metadata,
+                metadata_type_ref=metadata_type_id,
+                definition=definition
+            )
         )
+        type_id = res.fetchall()[0]
+
+        # Initialise search fields.
+        self._setup_dataset_type_fields(type_id, name, metadata_type_id, definition['metadata'],
+                                        concurrently=concurrently)
         return type_id
 
     def add_metadata_type(self, name, definition, concurrently=False):
@@ -596,31 +649,55 @@ class PostgresDb(object):
         type_id = res.inserted_primary_key[0]
         record = self.get_metadata_type(type_id)
 
-        # Initialise search fields.
-        _setup_collection_fields(
-            self._connection, name, self.get_dataset_fields(record),
-            where_expression=and_(DATASET.c.archived == None, DATASET.c.metadata_type_ref == type_id),
-            concurrently=concurrently
+        self._setup_metadata_type_fields(
+            type_id, name, record, concurrently=concurrently
         )
 
     def check_dynamic_fields(self, concurrently=False, rebuild_all=False):
         _LOG.info('Checking dynamic views/indexes. (rebuild all = %s)', rebuild_all)
         for metadata_type in self.get_all_metadata_types():
-            _setup_collection_fields(
-                self._connection, metadata_type['name'], self.get_dataset_fields(metadata_type),
-                where_expression=and_(DATASET.c.archived == None, DATASET.c.metadata_type_ref == metadata_type['id']),
-                concurrently=concurrently,
-                replace_existing=rebuild_all
+            self._setup_metadata_type_fields(
+                metadata_type['id'],
+                metadata_type['name'],
+                metadata_type,
+                rebuild_all, concurrently
             )
 
         for dataset_type in self.get_all_dataset_types():
-            _setup_collection_fields(
-                self._connection, dataset_type['name'],
-                self.get_dataset_fields(self.get_metadata_type(dataset_type['metadata_type_ref'])),
-                where_expression=and_(DATASET.c.archived == None, DATASET.c.dataset_type_ref == dataset_type['id']),
-                concurrently=concurrently,
-                replace_existing=rebuild_all
+            self._setup_dataset_type_fields(
+                dataset_type['id'],
+                dataset_type['name'],
+                dataset_type['metadata_type_ref'],
+                dataset_type['definition']['metadata'],
+                rebuild_all,
+                concurrently
             )
+
+    def _setup_metadata_type_fields(self, id_, name, record, rebuild_all=False, concurrently=True):
+        fields = self.get_dataset_fields(record)
+        dataset_filter = and_(DATASET.c.archived == None, DATASET.c.metadata_type_ref == id_)
+        _check_dynamic_fields(self._connection, concurrently, dataset_filter,
+                              (), fields, name, rebuild_all)
+
+    def _setup_dataset_type_fields(self, id_, name, metadata_type_id, metadata_doc,
+                                   rebuild_all=False, concurrently=True):
+        fields = self.get_dataset_fields(self.get_metadata_type(metadata_type_id))
+        dataset_filter = and_(DATASET.c.archived == None, DATASET.c.dataset_type_ref == id_)
+        excluded_field_names = tuple(self._get_active_field_names(metadata_type_id, metadata_doc))
+
+        _check_dynamic_fields(self._connection, concurrently, dataset_filter,
+                              excluded_field_names, fields, name, rebuild_all)
+
+    def _get_active_field_names(self, metadata_type_id, metadata_doc):
+        fields = self.get_dataset_fields(self.get_metadata_type(metadata_type_id))
+        for field in fields.values():
+            if hasattr(field, 'extract'):
+                try:
+                    value = field.extract(metadata_doc)
+                    if value is not None:
+                        yield field.name
+                except (AttributeError, KeyError, ValueError):
+                    continue
 
     def get_all_dataset_types(self):
         return self._connection.execute(DATASET_TYPE.select().order_by(DATASET_TYPE.c.name.asc())).fetchall()
@@ -721,66 +798,128 @@ def _pg_exists(conn, name):
     return conn.execute("SELECT to_regclass(%s)", name).scalar() is not None
 
 
-def _setup_collection_fields(conn, collection_prefix, fields, where_expression,
-                             concurrently=False, replace_existing=False):
+def contains_all(d_, *keys):
     """
-    Create indexes and views for a collection's search fields.
-    """
-    name = collection_prefix.lower()
+    Does the dictionary have values for all of the given keys?
 
-    # Create indexes for the search fields.
+    >>> contains_all({'a': 4}, 'a')
+    True
+    >>> contains_all({'a': 4, 'b': 5}, 'a', 'b')
+    True
+    >>> contains_all({'b': 5}, 'a')
+    False
+    """
+    return all([d_.get(key) for key in keys])
+
+
+def _check_dynamic_fields(conn, concurrently, dataset_filter, excluded_field_names, fields, name, rebuild_all):
+    """
+    Check that we have expected indexes and views for the given fields
+    """
+
+    # If this type has time/space fields, create composite indexes (as they are often searched together)
+    # We will probably move these into product configuration in the future.
+    composite_indexes = (
+        ('lat', 'lon', 'time'),
+        ('time', 'lat', 'lon'),
+        ('sat_path', 'sat_row', 'time')
+    )
+
+    for field_composite in composite_indexes:
+        # If all of the fields are available in this product, we'll create a composite index
+        # for them instead of individual indexes.
+        if contains_all(fields, *field_composite):
+            excluded_field_names += field_composite
+            _check_field_index(
+                conn,
+                [fields.get(f) for f in field_composite],
+                name, dataset_filter,
+                concurrently=concurrently,
+                replace_existing=rebuild_all,
+                index_type='gist'
+            )
+
+    # Create indexes for the individual fields.
     for field in fields.values():
-        index_type = field.postgres_index_type
-        if index_type:
-            # Our normal indexes start with "ix_", dynamic indexes with "dix_"
-            index_name = 'dix_{prefix}_{field_name}'.format(
-                prefix=name.lower(),
-                field_name=field.name.lower()
-            )
-            # Previous naming scheme
-            legacy_name = 'dix_field_{prefix}_dataset_{field_name}'.format(
-                prefix=name.lower(),
-                field_name=field.name.lower()
-            )
-            index = Index(
-                index_name,
-                field.alchemy_expression,
-                postgresql_where=where_expression,
-                postgresql_using=index_type,
-                # Don't lock the table (in the future we'll allow indexing new fields...)
-                postgresql_concurrently=concurrently
-            )
-            exists = _pg_exists(conn, tables.schema_qualified(index_name))
-            legacy_exists = _pg_exists(conn, tables.schema_qualified(legacy_name))
+        if not field.postgres_index_type:
+            continue
+        _check_field_index(
+            conn, [field],
+            name, dataset_filter,
+            should_exist=(field.name not in excluded_field_names),
+            concurrently=concurrently,
+            replace_existing=rebuild_all,
+        )
+    # A view of all fields
+    _ensure_view(conn, fields, name, rebuild_all, dataset_filter)
 
-            # This currently leaves a window of time without indexes: it's primarily intended for development.
-            if replace_existing:
-                if exists:
-                    _LOG.debug('Dropping index: %s (replace=%r)', index_name, replace_existing)
-                    index.drop(conn)
-                    exists = False
-                if legacy_exists:
-                    _LOG.debug('Dropping legacy index: %s (replace=%r)', legacy_name, replace_existing)
-                    Index(legacy_name, field.alchemy_expression).drop(conn)
-                    legacy_exists = False
 
-            if not (exists or legacy_exists):
-                _LOG.debug('Creating index: %s', index_name)
-                index.create(conn)
-            else:
-                _LOG.debug('Index exists: %s  (replace=%r)', index_name, replace_existing)
+def _check_field_index(conn, fields, name_prefix, filter_expression,
+                       should_exist=True, concurrently=False,
+                       replace_existing=False, index_type=None):
+    """
+    Check the status of a given index: add or remove it as needed
+    """
+    if index_type is None:
+        if len(fields) > 1:
+            raise ValueError('Must specify index type for composite indexes.')
+        index_type = fields[0].postgres_index_type
 
+    field_name = '_'.join([f.name.lower() for f in fields])
+    # Our normal indexes start with "ix_", dynamic indexes with "dix_"
+    index_name = 'dix_{prefix}_{field_name}'.format(
+        prefix=name_prefix.lower(),
+        field_name=field_name
+    )
+    # Previous naming scheme
+    legacy_name = 'dix_field_{prefix}_dataset_{field_name}'.format(
+        prefix=name_prefix.lower(),
+        field_name=field_name,
+    )
+    indexed_expressions = [f.alchemy_expression for f in fields]
+    index = Index(
+        index_name,
+        *indexed_expressions,
+        postgresql_where=filter_expression,
+        postgresql_using=index_type,
+        # Don't lock the table (in the future we'll allow indexing new fields...)
+        postgresql_concurrently=concurrently
+    )
+    exists = _pg_exists(conn, tables.schema_qualified(index_name))
+    legacy_exists = _pg_exists(conn, tables.schema_qualified(legacy_name))
+
+    # This currently leaves a window of time without indexes: it's primarily intended for development.
+    if replace_existing or (not should_exist):
+        if exists:
+            _LOG.debug('Dropping index: %s (replace=%r)', index_name, replace_existing)
+            index.drop(conn)
+            exists = False
+        if legacy_exists:
+            _LOG.debug('Dropping legacy index: %s (replace=%r)', legacy_name, replace_existing)
+            Index(legacy_name, *indexed_expressions).drop(conn)
+            legacy_exists = False
+
+    if should_exist:
+        if not (exists or legacy_exists):
+            _LOG.info('Creating index: %s', index_name)
+            index.create(conn)
+        else:
+            _LOG.debug('Index exists: %s  (replace=%r)', index_name, replace_existing)
+
+
+def _ensure_view(conn, fields, name, replace_existing, where_expression):
+    """
+    Ensure a view exists for the given fields
+    """
     # Create a view of search fields (for debugging convenience).
     # 'dv_' prefix: dynamic view. To distinguish from views that are created as part of the schema itself.
     view_name = tables.schema_qualified('dv_{}_dataset'.format(name))
     exists = _pg_exists(conn, view_name)
-
     # This currently leaves a window of time without the views: it's primarily intended for development.
     if exists and replace_existing:
         _LOG.debug('Dropping view: %s (replace=%r)', view_name, replace_existing)
         conn.execute('drop view %s' % view_name)
         exists = False
-
     if not exists:
         _LOG.debug('Creating view: %s', view_name)
         conn.execute(
@@ -795,7 +934,6 @@ def _setup_collection_fields(conn, collection_prefix, fields, where_expression,
         )
     else:
         _LOG.debug('View exists: %s (replace=%r)', view_name, replace_existing)
-
     legacy_name = tables.schema_qualified('{}_dataset'.format(name))
     if _pg_exists(conn, legacy_name):
         _LOG.debug('Dropping legacy view: %s', legacy_name)
@@ -813,10 +951,28 @@ def _json_fallback(obj):
     raise TypeError("Type not serializable: {}".format(type(obj)))
 
 
-class _BegunTransaction(object):
-    def __init__(self, connection):
-        self._connection = connection
+class _PostgresDbInTransaction(PostgresDb):
+    """
+    Identical to PostgresDb class, but all operations
+    are run against a single connection in a transaction.
+
+    Call commit() or rollback() to complete the transaction or use a context manager:
+
+        with db.begin() as transaction:
+            transaction.insert_dataset(...)
+
+    (Don't share an instance between threads)
+    """
+
+    def __init__(self, engine):
+        super(_PostgresDbInTransaction, self).__init__(engine)
+        self.__connection = engine.connect()
         self.begin()
+
+    @property
+    def _connection(self):
+        # Override parent so that we use the same connection in transaction
+        return self.__connection
 
     def begin(self):
         self._connection.execute(text('BEGIN'))

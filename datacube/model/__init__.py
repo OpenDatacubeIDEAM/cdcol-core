@@ -10,6 +10,7 @@ import os
 from collections import namedtuple, OrderedDict
 
 import numpy
+import cachetools
 from affine import Affine
 from osgeo import osr
 from pathlib import Path
@@ -74,8 +75,8 @@ class Dataset(object):
     :param str local_uri: A URI to access this dataset locally.
     """
 
-    def __init__(self, type_, metadata_doc, local_uri, sources=None):
-        #: :type: DatasetType
+    def __init__(self, type_, metadata_doc, local_uri, sources=None, indexed_by=None, indexed_time=None):
+        #: :rtype: DatasetType
         self.type = type_
 
         #: :type: dict
@@ -88,6 +89,11 @@ class Dataset(object):
         self.sources = sources or {}
 
         assert set(self.metadata.sources.keys()) == set(self.sources.keys())
+
+        # User who indexed this dataset
+        #: :type: str
+        self.indexed_by = indexed_by
+        self.indexed_time = indexed_time
 
     @property
     def metadata_type(self):
@@ -104,6 +110,9 @@ class Dataset(object):
 
     @property
     def id(self):
+        """
+        :rtype: uuid
+        """
         return self.metadata.id
 
     @property
@@ -117,6 +126,7 @@ class Dataset(object):
     @property
     def measurements(self):
         # It's an optional field in documents.
+        # Dictionary of key -> measurement descriptor
         if not hasattr(self.metadata, 'measurements'):
             return {}
         return self.metadata.measurements
@@ -136,12 +146,15 @@ class Dataset(object):
 
     @property
     def bounds(self):
+        """
+        :rtype: rasterio.coords.BoundingBox
+        """
         return self.extent.boundingbox
 
     @property
     def crs(self):
         """
-        :rtype: datacube.model.CRS
+        :rtype: CRS
         """
         projection = self.metadata.grid_spatial
 
@@ -161,8 +174,11 @@ class Dataset(object):
 
         raise RuntimeError('Cant figure out the projection: %s %s' % (projection['datum'], projection['zone']))
 
-    @property
+    @cached_property
     def extent(self):
+        """
+        :rtype: GeoPolygon
+        """
         def xytuple(obj):
             return obj['x'], obj['y']
 
@@ -174,6 +190,12 @@ class Dataset(object):
         else:
             geo_ref_points = projection['geo_ref_points']
             return GeoPolygon([xytuple(geo_ref_points[key]) for key in ('ll', 'ul', 'ur', 'lr')], crs=self.crs)
+
+    def __eq__(self, other):
+        return self.id == other.id
+
+    def __hash__(self):
+        return hash(self.id)
 
     def __str__(self):
         return "Dataset <id={id} type={type} location={loc}>".format(id=self.id,
@@ -209,20 +231,35 @@ def schema_validated(schema):
     return decorate
 
 
+class Measurement(object):
+    def __init__(self, measurement_dict):
+        self.name = measurement_dict['name']
+        self.dtype = measurement_dict['dtype']
+        self.nodata = measurement_dict['nodata']
+        self.units = measurement_dict['units']
+        self.aliases = measurement_dict['aliases']
+        self.spectral_definition = measurement_dict['spectral_definition']
+        self.flags_definition = measurement_dict['flags_definition']
+
+
 @schema_validated('metadata-type-schema.yaml')
 class MetadataType(object):
+    """Metadata Type definition"""
     def __init__(self,
                  name,
                  dataset_offsets,
                  dataset_search_fields,
                  id_=None):
+        #: :type: str
         self.name = name
-        #: :type: DatasetOffsets
+
+        #: :rtype: DatasetOffsets
         self.dataset_offsets = dataset_offsets
 
-        #: :type: dict[str, datacube.index.fields.Field]
+        #: :rtype: dict[str,datacube.index.fields.Field]
         self.dataset_fields = dataset_search_fields
 
+        #: :type: int
         self.id = id_
 
     def dataset_reader(self, dataset_doc):
@@ -235,27 +272,29 @@ class MetadataType(object):
 @schema_validated('dataset-type-schema.yaml')
 class DatasetType(object):
     """
-    Definition of a Dataset
+    Product definition
 
-    :type metadata_type: MetadataType
+    :param MetadataType metadata_type:
+    :param dict definition:
     """
-
     def __init__(self,
                  metadata_type,
                  definition,
                  id_=None):
-        self.validate(definition)
-
+        #: :type: int
         self.id = id_
 
-        # All datasets in a collection must have the same metadata_type.
+        #: :rtype: MetadataType
         self.metadata_type = metadata_type
 
-        # DatasetType definition.
+        #: product definition document
         self.definition = definition
 
     @property
     def name(self):
+        """
+        :type: str
+        """
         return self.definition['name']
 
     @property
@@ -276,52 +315,30 @@ class DatasetType(object):
 
     @property
     def measurements(self):
+        """
+        Dictionary of measurements in this product
+
+        :type: dict[str, dict]
+        """
         return OrderedDict((m['name'], m) for m in self.definition.get('measurements', []))
 
     @property
     def dimensions(self):
+        """
+        List of dimensions for data in this product
+
+        :type: tuple[str]
+        """
         assert self.metadata_type.name == 'eo'
         return ('time',) + self.grid_spec.dimensions
 
-    @property
-    def fixed_fields(self):
-        """
-        Search fields identical to all datasets of this type.
-        """
-        fs = {k: v for (k, v) in self.metadata.fields.items() if v is not None}
-        fs['product'] = self.name
-        fs['metadata_type'] = self.metadata_type.name
-        return fs
-
-    def matches(self, **query):
-        """
-        May this dataset type return results for the given query?
-        """
-        # Fixed (non-document) fields
-        if 'product' in query:
-            if query['product'] != self.name:
-                return False
-            query = dict(query)
-            del query['product']
-        if 'metadata_type' in query:
-            if query['metadata_type'] != self.metadata_type.name:
-                return False
-            query = dict(query)
-            del query['metadata_type']
-
-        for key, value in query.items():
-            if key not in self.metadata.fields:
-                return False
-
-            expected_value = getattr(self.metadata, key)
-            # If there's an expected value it should match
-            if (expected_value is not None) and expected_value != value:
-                return False
-
-        return True
-
-    @property
+    @cached_property
     def grid_spec(self):
+        """
+        Grid specification for this product
+
+        :rtype: GridSpec
+        """
         if 'storage' not in self.definition:
             return None
         storage = self.definition['storage']
@@ -388,6 +405,9 @@ class GeoPolygon(object):
 
     @property
     def boundingbox(self):
+        """
+        :rtype: rasterio.coords.BoundingBox
+        """
         return BoundingBox(left=min(x for x, y in self.points),
                            bottom=min(y for x, y in self.points),
                            right=max(x for x, y in self.points),
@@ -415,7 +435,30 @@ class GeoPolygon(object):
 
 
 class FlagsDefinition(object):
-    pass
+    def __init__(self, flags_def_dict):
+        self.flags_def_dict = flags_def_dict
+
+        # blue_saturated:
+        #   bits: 0
+        #   description: Blue band is saturated
+        #   values: {0: true, 1: false}
+        # green_saturated:
+        #   bits: 1
+        #   description: Green band is saturated
+        #   values: {0: true, 1: false}
+        # red_saturated:
+        #   bits: 2
+        #   description: Red band is saturated
+        #   values: {0: true, 1: false}
+        # nir_saturated:
+        #   bits: 3
+        #   description: NIR band is saturated
+        #   values: {0: true, 1: false}
+
+
+class SpectralDefinition(object):
+    def __init__(self, spec_def_dict):
+        self.spec_def_dict = spec_def_dict
 
 
 class CRSProjProxy(object):
@@ -424,6 +467,15 @@ class CRSProjProxy(object):
 
     def __getattr__(self, item):
         return self._crs.GetProjParm(item)
+
+
+@cachetools.cached({})
+def _make_crs(crs_str):
+    crs = osr.SpatialReference()
+    crs.SetFromUserInput(crs_str)
+    if not crs.ExportToProj4() or crs.IsGeographic() == crs.IsProjected():
+        raise ValueError('Not a valid CRS: %s' % crs_str)
+    return crs
 
 
 class CRS(object):
@@ -448,14 +500,24 @@ class CRS(object):
     True
     >>> CRS('EPSG:3577') == CRS('EPSG:4326')
     False
+    >>> CRS('blah')
+    Traceback (most recent call last):
+        ...
+    ValueError: Not a valid CRS: blah
+    >>> CRS('PROJCS["unnamed",\
+    ... GEOGCS["WGS 84", DATUM["WGS_1984", SPHEROID["WGS 84",6378137,298.257223563, AUTHORITY["EPSG","7030"]],\
+    ... AUTHORITY["EPSG","6326"]], PRIMEM["Greenwich",0, AUTHORITY["EPSG","8901"]],\
+    ... UNIT["degree",0.0174532925199433, AUTHORITY["EPSG","9122"]], AUTHORITY["EPSG","4326"]]]')
+    Traceback (most recent call last):
+        ...
+    ValueError: Not a valid CRS: ...
     """
 
     def __init__(self, crs_str):
         if isinstance(crs_str, CRS):
             crs_str = crs_str.crs_str
         self.crs_str = crs_str
-        self._crs = osr.SpatialReference()
-        self._crs.SetFromUserInput(crs_str)
+        self._crs = _make_crs(crs_str)
 
     def __getitem__(self, item):
         return self._crs.GetAttrValue(item)
@@ -468,6 +530,11 @@ class CRS(object):
 
     @property
     def wkt(self):
+        """
+        WKT representation of the CRS
+
+        :type: str
+        """
         return self._crs.ExportToWkt()
 
     @property
@@ -488,14 +555,25 @@ class CRS(object):
 
     @property
     def geographic(self):
+        """
+        :type: bool
+        """
         return self._crs.IsGeographic() == 1
 
     @property
     def projected(self):
+        """
+        :type: bool
+        """
         return self._crs.IsProjected() == 1
 
     @property
     def dimensions(self):
+        """
+        List of dimension names of the CRS
+
+        :type: (str,str)
+        """
         if self.geographic:
             return 'latitude', 'longitude'
 
@@ -536,18 +614,26 @@ class GridSpec(object):
            0.0, -0.001, -48.0), EPSG:4326))]
 
     :param CRS crs: Coordinate System used to define the grid
-    :param tuple(y, x) tile_size: Size of each tile, in CRS units
-    :param tuple(y, x) resolution: Size of each data point in the grid, in CRS units. Y will
+    :param (float,float) tile_size: (Y, X) size of each tile, in CRS units
+    :param (float,float) resolution: (Y, X) size of each data point in the grid, in CRS units. Y will
                                    usually be negative.
     """
 
     def __init__(self, crs=None, tile_size=None, resolution=None):
+        #: :rtype: CRS
         self.crs = crs
+        #: :type: (float,float)
         self.tile_size = tile_size
+        #: :type: (float,float)
         self.resolution = resolution
 
     @property
     def dimensions(self):
+        """
+        List of dimension names of the grid spec
+
+        :type: (str,str)
+        """
         return self.crs.dimensions
 
     @property
@@ -557,7 +643,7 @@ class GridSpec(object):
 
         Units will be in CRS dimension order (Usually y,x or lat,lon)
 
-        :return: tuple()
+        :type: (float, float)
         """
         return tuple(int(abs(ts / res)) for ts, res in zip(self.tile_size, self.resolution))
 
@@ -626,20 +712,26 @@ class GeoBox(object):
             151.999625,  151.999875])
     >>> t.geographic_extent.points
     [(151.0, -29.0), (151.0, -30.0), (152.0, -30.0), (152.0, -29.0)]
+    >>> t.resolution
+    (-0.00025, 0.00025)
 
 
     :param CRS crs: Coordinate Reference System
-    :param affine.Affine affine: Affine transformation defining the location of the storage unit
+    :param affine.Affine affine: Affine transformation defining the location of the geobox
     """
 
     def __init__(self, width, height, affine, crs):
-        assert height > 0 and width > 0
+        assert height > 0 and width > 0, "Can't create GeoBox of zero size"
+        #: :type: int
         self.width = width
+        #: :type: int
         self.height = height
+        #: :rtype: affine.Affine
         self.affine = affine
 
         points = [(0, 0), (0, height), (width, height), (width, 0)]
         self.affine.itransform(points)
+        #: :rtype: GeoPolygon
         self.extent = GeoPolygon(points, crs)
 
     @classmethod
@@ -664,40 +756,39 @@ class GeoBox(object):
                    height=int(tile_size_y / abs(tile_res_y)))
 
     @classmethod
-    def from_geopolygon(cls, geopolygon, resolution, crs=None, align=True):
+    def from_geopolygon(cls, geopolygon, resolution, crs=None, align=None):
         """
         :type geopolygon: GeoPolygon
         :param resolution: (x_resolution, y_resolution)
         :param CRS crs: CRS to use, if different from the geopolygon
-        :param bool align: Should the geobox be aligned to pixels of the given resolution.
-                           This assumes an origin of (0,0).
+        :param (float,float) align: Alight geobox such that point 'align' lies on the pixel boundary.
         :rtype: GeoBox
         """
         # TODO: currently only flipped Y-axis data is supported
 
-        assert resolution[1] > 0
-        assert resolution[0] < 0
+        assert resolution[1] > 0, "decreasing X coordinates are not supported"
+        assert resolution[0] < 0, "increasing Y coordinates are not supported"
+
+        align = align or (0.0, 0.0)
+        assert 0.0 <= align[1] <= abs(resolution[1]), "X align must be in [0, abs(x_resolution)] range"
+        assert 0.0 <= align[0] <= abs(resolution[0]), "Y align must be in [0, abs(y_resolution)] range"
 
         if crs is None:
             crs = geopolygon.crs
         else:
             geopolygon = geopolygon.to_crs(crs)
 
+        def align_pix(val, res, off):
+            return math.floor((val-off)/res) * res + off
+
         bounding_box = geopolygon.boundingbox
-        left, top = float(bounding_box.left), float(bounding_box.top)
-        if align:
-            left = math.floor(left / resolution[1]) * resolution[1]
-            top = math.floor(top / resolution[0]) * resolution[0]
+        left = align_pix(bounding_box.left, resolution[1], align[1])
+        top = align_pix(bounding_box.top, resolution[0], align[0])
         affine = (Affine.translation(left, top) * Affine.scale(resolution[1], resolution[0]))
-        right, bottom = float(bounding_box.right), float(bounding_box.bottom)
-        width, height = ~affine * (right, bottom)
-        if align:
-            width = math.ceil(width)
-            height = math.ceil(height)
         return GeoBox(crs=crs,
                       affine=affine,
-                      width=int(width),
-                      height=int(height))
+                      width=max(1, int(math.ceil((bounding_box.right-left-0.1*resolution[1])/resolution[1]))),
+                      height=max(1, int(math.ceil((bounding_box.bottom-top-0.1*resolution[0])/resolution[0]))))
 
     def __getitem__(self, item):
         indexes = [slice(index.start or 0, index.stop or size, index.step or 1)
@@ -714,18 +805,52 @@ class GeoBox(object):
 
     @property
     def shape(self):
+        """
+        :type: (int,int)
+        """
         return self.height, self.width
 
     @property
     def crs(self):
+        """
+        :rtype: CRS
+        """
         return self.extent.crs
 
     @property
     def dimensions(self):
+        """
+        List of dimension names of the GeoBox
+
+        :type: (str,str)
+        """
         return self.crs.dimensions
 
     @property
+    def resolution(self):
+        """
+        Resolution in Y,X dimensions
+
+        :type: (float,float)
+        """
+        return self.affine.e, self.affine.a
+
+    @property
+    def alignment(self):
+        """
+        Alignment of pixel boundaries in Y,X dimensions
+
+        :type: (float,float)
+        """
+        return self.affine.yoff % abs(self.affine.e), self.affine.xoff % abs(self.affine.a)
+
+    @property
     def coordinates(self):
+        """
+        dict of coordinate labels
+
+        :type: dict[str,numpy.array]
+        """
         xs = numpy.arange(self.width) * self.affine.a + self.affine.c + self.affine.a / 2
         ys = numpy.arange(self.height) * self.affine.e + self.affine.f + self.affine.e / 2
 
@@ -744,6 +869,9 @@ class GeoBox(object):
 
     @property
     def geographic_extent(self):
+        """
+        :rtype: GeoPolygon
+        """
         if self.crs.geographic:
             return self.extent
         return self.extent.to_crs(CRS('EPSG:4326'))
