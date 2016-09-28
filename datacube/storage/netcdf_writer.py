@@ -148,8 +148,9 @@ def _write_utm_params(crs_var, crs):
     #http://cfconventions.org/Data/cf-conventions/cf-conventions-1.7/build/cf-conventions.html#appendix-grid-mappings at the transverse mercator section.
     crs_var.grid_mapping_name = 'transverse_mercator'
     crs_var.scale_factor_at_central_meridian = crs.proj.scale_factor
-    crs_var.longitude_of_central_meridian = crs.proj.longitude_of_center
+    crs_var.longitude_of_central_meridian = crs.proj.central_meridian
     crs_var.latitude_of_projection_origin = crs.proj.latitude_of_center
+    crs_var.longitude_of_projection_origin = crs.proj.longitude_of_center
 
 def _write_sinusoidal_params(crs_var, crs):
     crs_var.grid_mapping_name = 'sinusoidal'
