@@ -20,8 +20,9 @@ import numpy
 
 from affine import Affine
 import rasterio.warp
+import rasterio.enums
 import rasterio.crs
-from rasterio.warp import RESAMPLING
+from rasterio.enums import Resampling as RESAMPLING
 
 from datacube.utils import clamp, datetime_to_seconds_since_1970
 
