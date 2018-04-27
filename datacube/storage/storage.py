@@ -179,6 +179,9 @@ class DatasetSource(object):
                 break
         else:
             bandnumber = self._descriptor.get('layer', 1)
+        
+        if bandnumber > 1 and rasterio.__version__ == '1.0a9':
+            self.override= True
 
         try:
             _LOG.debug("openening %s, band %s", filename, bandnumber)
